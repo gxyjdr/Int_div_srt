@@ -1,0 +1,10 @@
+read_blif input.blif
+read_lib -w asap7_simple_RVT_SS.lib
+strash
+&get -n
+&fraig -x
+&put
+dc2
+dretime
+map -D 500
+write_blif output.blif

@@ -1,0 +1,29 @@
+{
+  "generated_by": "chip-design-infrastructure",
+  "generated_at": "2026-06-01",
+  "open_source_first": true,
+  "capabilities": {
+    "simulation": [
+      {"tool": "verilator", "path": "/usr/bin/verilator", "version": "4.038", "type": "open-source"}
+    ],
+    "synthesis": [
+      {"tool": "yosys", "path": "/usr/bin/yosys", "version": "0.9", "type": "open-source"}
+    ],
+    "sta": [],
+    "formal_fpv": [],
+    "formal_equiv": [],
+    "physical_design": [],
+    "lint": [
+      {"tool": "verilator", "path": "/usr/bin/verilator", "version": "4.038", "type": "open-source"}
+    ],
+    "waveform": [],
+    "compiler": [
+      {"tool": "gcc", "path": "/usr/bin/gcc", "version": "11.4.0", "type": "open-source"}
+    ]
+  },
+  "not_configured": ["sta", "formal_fpv", "formal_equiv", "physical_design", "waveform", "cdc", "dft"],
+  "user_actions": [
+    "sta: install OpenSTA — sudo apt install opensta",
+    "waveform: install GTKWave — sudo apt install gtkwave"
+  ]
+}

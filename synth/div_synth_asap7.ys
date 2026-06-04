@@ -1,0 +1,18 @@
+read_verilog -sv div_srt4_synth.sv
+hierarchy -check -top div_srt4_top
+proc
+opt
+flatten
+opt
+synth -top div_srt4_top
+
+# Map combinational logic to ASAP7 cells (timing-driven)
+abc -liberty asap7_combined_SS.lib -D 500 -script "+strash; &get -n; &fraig -x; &put; dc2; dretime; map -D 500"
+
+# Map DFFs to ASAP7 sequential cells via techmap
+techmap -map techmap_dff.v
+
+opt_clean -purge
+stat -top div_srt4_top -liberty asap7_combined_SS.lib
+write_verilog -noattr div_srt4_top_asap7.v
+write_json div_srt4_top_asap7.json

@@ -1,0 +1,37 @@
+read_liberty -max SIMPLE_RVT_SS.lib
+read_liberty -max INVBUF_RVT_SS.lib
+read_liberty -max SEQ_RVT_SS.lib
+read_liberty -max AO_RVT_SS.lib
+read_verilog div_srt4_top_asap7_fixed.v
+link_design div_srt4_top
+read_sdc div_srt4_top.sdc
+
+puts "\n===== CSA DESIGN SUMMARY ====="
+puts "Clock period: 500 ps (2 GHz)"
+puts "Liberty: SS corner, RVT"
+puts ""
+
+puts "--- Cell Counts ---"
+# Count cells by type
+puts "MAJIxp5: [exec grep -c MAJIxp5 div_srt4_top_asap7_fixed.v]"
+puts "NAND2xp33: [exec grep -c NAND2xp33 div_srt4_top_asap7_fixed.v]"
+puts "DFF: [exec grep -c DFFASRHQNx1 div_srt4_top_asap7_fixed.v]"
+puts "INV: [exec grep -c INVx1_ASAP7 div_srt4_top_asap7_fixed.v]"
+puts ""
+
+puts "--- Setup Timing ---"
+report_wns
+report_tns
+
+puts "\n--- Worst Input-to-REG Path ---"
+report_checks -from [all_inputs] -to [all_registers] -endpoint_path_count 1 -slack_max 0
+
+puts "\n--- Worst REG-to-OUTPUT Path ---"
+report_checks -from [all_registers] -to [all_outputs] -endpoint_path_count 1 -slack_max 0
+
+puts "\n--- Worst REG-to-REG Path ---"
+report_checks -from [all_registers] -to [all_registers] -endpoint_path_count 1 -slack_max 0
+
+puts "\n=========================================="
+puts "REFERENCE: OLD CPA design was -6235 ps WNS"
+puts "=========================================="

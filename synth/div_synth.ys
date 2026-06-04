@@ -1,0 +1,43 @@
+#=============================================================================
+# div_synth.ys — Yosys synthesis script for SRT-4 Radix-4 Integer Divider
+#=============================================================================
+# Usage: yosys div_synth.ys
+# Target: generic synthesis (technology-independent)
+# Uses single-file synthesis-friendly SV source
+#=============================================================================
+
+# Step 1: Read single-file synthesis source
+read_verilog -sv div_srt4_synth.sv
+
+# Step 2: Elaborate hierarchy
+hierarchy -check -top div_srt4_top
+
+# Step 3: Convert processes to netlist
+proc
+
+# Step 4: Optimize
+opt
+
+# Step 5: Flatten hierarchy for better optimization
+flatten
+
+# Step 6: Further optimization
+opt
+
+# Step 7: Technology-independent synthesis
+synth -top div_srt4_top
+
+# Step 8: Map to generic gates
+abc -g AND,OR,XOR,MUX,NAND,NOR
+
+# Step 9: Cleanup unused
+opt_clean -purge
+
+# Step 10: Statistics
+stat -top div_srt4_top
+
+# Step 11: Write netlist
+write_verilog -noattr div_srt4_top_netlist.v
+
+# Step 12: Write JSON for analysis
+write_json div_srt4_top.json
