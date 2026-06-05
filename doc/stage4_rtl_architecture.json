@@ -1,0 +1,247 @@
+{
+  "$schema": "stage4_rtl_architecture",
+  "version": "1.1",
+  "design_name": "div_srt",
+  "reviewed_inputs": [
+    "doc/stage2_spec_review.json",
+    "doc/stage3_microarch_analysis.json"
+  ],
+  "rtl_framework": {
+    "style": "hierarchical",
+    "description": "Four-module hierarchical structure centered on a package + combinational QDS + datapath + top-level FSM. The package defines all shared types, parameters, and the QDS lookup function (as a package function, not standalone module). The QDS module is a thin combinational wrapper around the package function. The datapath encapsulates all storage and arithmetic (CLZ, normalization, CSA iteration loop, OTF accumulation, CORRECT CPA, PR-based remainder recovery). The top module owns the FSM, handshake logic, short-circuit detection, sign correction, output registers, and clock gating control."
+  },
+  "module_hierarchy": [
+    {
+      "name": "div_srt_pkg",
+      "parent": "(package, imported by all modules)",
+      "responsibility": "Define all compile-time parameters (WIDTH, PR_WIDTH, Q_WIDTH, MAX_ITER, QDS_PR_BITS, QDS_DIV_BITS, LZC_BITS, ITER_CNT_BITS). Define shared types (qds_digit_t, state_t). Implement qds_lookup() function with M1/M2 threshold table. No sequential logic — pure parameter/type/function container.",
+      "interfaces": [],
+      "parameters": ["WIDTH=64", "PR_WIDTH=68", "Q_WIDTH=64", "MAX_ITER=32", "QDS_PR_BITS=7", "QDS_DIV_BITS=3", "LZC_BITS=7", "ITER_CNT_BITS=$clog2(33)=6"],
+      "estimated_complexity": "low"
+    },
+    {
+      "name": "div_srt_qds",
+      "parent": "div_srt_top",
+      "responsibility": "Pure combinational wrapper. Receives pr_est_i (7-bit signed) and d_hat_i (3-bit) from datapath. Calls pkg::qds_lookup() and outputs q_digit_o (3-bit qds_digit_t encoding). No registers, no clock, no reset. Exists as separate module for synthesis boundary clarity (QDS vs datapath) and to simplify future replacement for SRT-8 QDS.",
+      "interfaces": ["pr_est_i (7b signed, input)", "d_hat_i (3b, input)", "q_digit_o (3b, output)"],
+      "parameters": [],
+      "estimated_complexity": "low"
+    },
+    {
+      "name": "div_srt_datapath",
+      "parent": "div_srt_top",
+      "responsibility": "All datapath storage and arithmetic. Subdivided into four functional slices: (a) PREPARE slice — two 64-bit CLZ trees, two 64-bit barrel shifters for normalization, K/N/shift calculation, (b) ITERATE slice — 68-bit CSA 3:2 compressor with <<2 shift, mult mux (5-way, -2D to +2D), pr_sum/pr_carry registers, (c) OTF slice — Q/QM 64-bit accumulators with per-digit update logic, iter_cnt, (d) CORRECT slice — 68-bit CPA (pr_sum+pr_carry), pr_full register, sign correction adder, PR-based R recovery barrel shifters. Interfaces: no clock gating self-management (controlled by top-level gating signals).",
+      "interfaces": [
+        "abs_dividend_i[64], abs_divisor_i[64] (input, from top)",
+        "prep_step, iter_step, corr_step (input, pulse from top FSM)",
+        "q_digit_i[3] (input, from QDS)",
+        "pr_est_o[7] (output, to QDS), d_hat_o[3] (output, to QDS)",
+        "done_o (output, to FSM — iter_cnt == N-1)",
+        "quotient_o[64], remainder_o[64] (combinational, to top)"
+      ],
+      "parameters": ["WIDTH (from pkg)", "PR_WIDTH (from pkg)", "Q_WIDTH (from pkg)", "MAX_ITER (from pkg)"],
+      "estimated_complexity": "high"
+    },
+    {
+      "name": "div_srt_top",
+      "parent": "(top-level)",
+      "responsibility": "Top-level integration. Owns: (a) FSM — 6-state sequencer (IDLE/PREPARE/ITERATE/CORRECT/CORRECT2/OUTPUT) with control pulse generation (prep/iter/corr_step), (b) Input handshake — valid_i/ready_o with operand latching on IDLE→PREPARE, (c) Output handshake — valid_o/ready_i with OUTPUT stalling, (d) Short-circuit detection — 5 priority-ordered conditions with direct-to-OUTPUT bypass, (e) Sign processing — dividend/divisor sign capture, abs() generation, apply_sign() for quotient/remainder output, (f) Output registers — quotient/remainder/exception flags registered with hold-until-consumed behavior, (g) Clock gating control — state-based ICG enable generation for datapath sub-slices. Instantiates: u_qds, u_datapath.",
+      "interfaces": [
+        "clk, rst_n (top-level ports)",
+        "valid_i, ready_o, dividend_i[64], divisor_i[64], signed_op_i (input handshake)",
+        "valid_o, ready_i, quotient_o[64], remainder_o[64] (output handshake)",
+        "div_by_zero_o, overflow_o, busy_o (status outputs)"
+      ],
+      "parameters": ["WIDTH (from pkg)"],
+      "estimated_complexity": "medium"
+    }
+  ],
+  "interface_ownership": {
+    "_note": "All internal interfaces use custom valid/ready style or direct combinational wiring. No standard bus protocol (AXI/APB) on internal paths.",
+    "external_interfaces": [
+      {
+        "interface": "input_handshake",
+        "owner_module": "div_srt_top",
+        "connected_to": "CPU execution unit (issue stage)",
+        "protocol": "custom_valid_ready",
+        "width": "valid_i[1], ready_o[1], dividend_i[64], divisor_i[64], signed_op_i[1]"
+      },
+      {
+        "interface": "output_handshake",
+        "owner_module": "div_srt_top",
+        "connected_to": "CPU execution unit (writeback stage)",
+        "protocol": "custom_valid_ready",
+        "width": "valid_o[1], ready_i[1], quotient_o[64], remainder_o[64], div_by_zero_o[1], overflow_o[1]"
+      }
+    ],
+    "internal_interfaces": [
+      {
+        "interface": "abs_dividend_divisor",
+        "owner_module": "div_srt_top",
+        "connected_to": "→ div_srt_datapath",
+        "protocol": "combinational",
+        "width": "abs_dividend_i[64], abs_divisor_i[64]"
+      },
+      {
+        "interface": "control_pulses",
+        "owner_module": "div_srt_top (FSM)",
+        "connected_to": "→ div_srt_datapath",
+        "protocol": "pulse (1-cycle strobe)",
+        "width": "prep_step[1], iter_step[1], corr_step[1]"
+      },
+      {
+        "interface": "qds_loop",
+        "owner_module": "div_srt_datapath",
+        "connected_to": "pr_est_o/d_hat_o → div_srt_qds → q_digit_o → div_srt_datapath",
+        "protocol": "combinational (within ITERATE state)",
+        "width": "pr_est[7] (signed), d_hat[3], q_digit[3]"
+      },
+      {
+        "interface": "done_signal",
+        "owner_module": "div_srt_datapath",
+        "connected_to": "→ div_srt_top (FSM)",
+        "protocol": "combinational",
+        "width": "done_o[1]"
+      },
+      {
+        "interface": "raw_results",
+        "owner_module": "div_srt_datapath",
+        "connected_to": "→ div_srt_top (OUTPUT state)",
+        "protocol": "combinational (valid when FSM in CORRECT2/OUTPUT)",
+        "width": "quotient_o[64], remainder_o[64]"
+      }
+    ]
+  },
+  "parameter_propagation": [
+    {
+      "parameter": "WIDTH=64",
+      "defined_at": "div_srt_pkg",
+      "propagated_to": ["div_srt_top (ports)", "div_srt_datapath (operand registers)", "div_srt_qds (indirect)"],
+      "compile_time": true
+    },
+    {
+      "parameter": "PR_WIDTH=68",
+      "defined_at": "div_srt_pkg",
+      "propagated_to": ["div_srt_datapath (pr_sum/carry/full registers, CSA, CPA)"],
+      "compile_time": true
+    },
+    {
+      "parameter": "Q_WIDTH=64",
+      "defined_at": "div_srt_pkg",
+      "propagated_to": ["div_srt_datapath (Q_q, QM_q registers)"],
+      "compile_time": true
+    },
+    {
+      "parameter": "MAX_ITER=32",
+      "defined_at": "div_srt_pkg",
+      "propagated_to": ["div_srt_datapath (iter_cnt width, done comparison)"],
+      "compile_time": true
+    },
+    {
+      "parameter": "QDS_PR_BITS=7, QDS_DIV_BITS=3",
+      "defined_at": "div_srt_pkg",
+      "propagated_to": ["div_srt_qds (port widths)", "div_srt_datapath (pr_est_o/d_hat_o port widths)"],
+      "compile_time": true
+    },
+    {
+      "parameter": "LZC_BITS=7",
+      "defined_at": "div_srt_pkg",
+      "propagated_to": ["div_srt_datapath (clz64 output, n/shift/lzc_d registers)"],
+      "compile_time": true
+    }
+  ],
+  "clock_reset_cdc": {
+    "clock_domains": [
+      {
+        "name": "clk",
+        "frequency_mhz": 2500,
+        "source": "CPU core clock (PLL-generated)"
+      }
+    ],
+    "reset_strategy": "Single asynchronous active-low reset (rst_n). All FFs use async reset (reset pin of DFF). No reset synchronization needed (single domain). Reset assertion clears all state: FSM → IDLE, datapath registers → 0, output registers → 0, exception flags → 0, valid_o → 0. No partial reset or sw-reset override.",
+    "cdc_crossings": [],
+    "cdc_owner_module": "div_srt_top (N/A — single clock domain)"
+  },
+  "scaffold_direction": {
+    "arithmetic": "CLZ64 uses priority-encoder tree (iterative comparison). Barrel shifters share a common 64-bit funnel-shifter structure (potentially reusable between D_norm left-shift and remainder right-shift). CSA iteration loop uses 68-bit parallel XOR/AND for 3:2 compression. CORRECT 68-bit CPA: if timing requires, implement as carry-select adder (CSA groups of 4-8 bits with carry-mux) rather than depending on synthesis tool's ripple-carry behavior.",
+    "control": "6-state one-hot or binary-encoded FSM. Hot-encoded preferred for decode simplicity and lower glitch power. Control pulses (prep/iter/corr_step) decoded combinationally from current state — no additional pipeline registers on pulse generation. Short-circuit detection priority-encoded via if-elseif chain (priority implicit in evaluation order).",
+    "interface": "All external I/O registered at top boundary. Input ports feed directly into operand flip-flops (registered on IDLE→PREPARE). Output ports fed from output registers (updated in OUTPUT, held until consumed). clk and rst_n are the only unregistered inputs.",
+    "memory": "No SRAM, FIFO, or CAM structures. All storage is flip-flop based (approximately 480 FFs in datapath + 70 FFs in top). Register count breakdown: operand regs (2×64), norm regs (1×64), PR regs (3×68), Q/QM (2×64), ctrl regs (3×7+1×6), output regs (2×64+2×1+1×1). No memory compiler or custom array required.",
+    "clock_gating": "State-based integrated clock gate (ICG) cells. Enables per functional slice: (a) PREPARE slice gated after prep_step until next operation, (b) ITERATE slice gated when not in ST_ITERATE, (c) CORRECT slice gated when not in ST_CORRECT, (d) OTF slice gated when not in ST_ITERATE, (e) Output registers clock-enabled by valid_o state (not gated — need update on OUTPUT). Estimated dynamic power reduction: 55-70% at typical workload."
+  },
+  "implementation_order": [
+    {
+      "priority": 1,
+      "module": "div_srt_pkg",
+      "reason": "Package must exist first — all other modules import from it. Changes here (parameter tuning, QDS table updates) cascade everywhere.",
+      "dependencies": []
+    },
+    {
+      "priority": 2,
+      "module": "div_srt_datapath",
+      "reason": "Core datapath is the most complex module and the main verification target. Implement and verify independently before integration.",
+      "dependencies": ["div_srt_pkg"]
+    },
+    {
+      "priority": 3,
+      "module": "div_srt_qds",
+      "reason": "Small combinational module. Can be implemented in parallel with datapath but listed separately for clarity.",
+      "dependencies": ["div_srt_pkg"]
+    },
+    {
+      "priority": 4,
+      "module": "div_srt_top",
+      "reason": "Top-level FSM and integration. Requires all submodules to exist for instantiation.",
+      "dependencies": ["div_srt_pkg", "div_srt_datapath", "div_srt_qds"]
+    },
+    {
+      "priority": 5,
+      "module": "Simulation and verification",
+      "reason": "Simulation infrastructure (Makefile, sim_main.cpp, testbench) updated to match renamed modules. Full regression 35925+ cases.",
+      "dependencies": ["div_srt_top"]
+    },
+    {
+      "priority": 6,
+      "module": "Synthesis and STA",
+      "reason": "Re-synthesize with updated naming, evaluate 2.5 GHz timing closure, iterate on CORRECT CPA if needed.",
+      "dependencies": ["Simulation and verification"]
+    }
+  ],
+  "architecture_risks": [
+    {
+      "id": 1,
+      "risk": "CORRECT 68-bit CPA timing at 2.5 GHz (400 ps): The first synthesis at 2 GHz with RVT xp33 cells showed WNS = -6836 ps for the 68-bit CPA path. At 2.5 GHz the period shrinks from 500 ps to 400 ps, requiring >20% more timing performance. The CSA iteration loop has margin (<500 ps at 2 GHz), but the CORRECT CPA and output path remain concerns.",
+      "severity": "high",
+      "mitigation": "Three-tier approach: (a) Use SLVT cells + larger drive strengths for the CPA path (expect ~2-3× speedup), (b) If (a) insufficient, restructure CPA as carry-select (4-bit groups with carry mux) to reduce critical path to ~8-10 gate levels, (c) If (b) still insufficient, pipeline the CPA across two cycles (adds 1 cycle to every division — from 37 to 38 max)."
+    },
+    {
+      "id": 2,
+      "risk": "Naming migration completeness: All existing files use div_srt4_* prefix. Any missed reference will cause compilation failure. Affected files: 4 RTL files, 1 testbench, 1 C++ testbench, 1 Makefile, design doc, synthesis scripts, STA scripts.",
+      "severity": "medium",
+      "mitigation": "Use systematic find-and-replace with diff review. Document all files requiring changes before starting. Run full regression after rename to catch any missed references."
+    },
+    {
+      "id": 3,
+      "risk": "Clock gating adds timing complexity: ICG cells have setup/hold requirements on the enable signal. The enable generation logic (state decode) adds delay to the clock path. If the enable arrives late relative to the clock, the ICG may glitch or miss a pulse.",
+      "severity": "medium",
+      "mitigation": "Use latch-based ICG cells (standard practice). Pipeline enable generation one cycle ahead where possible. Verify ICG timing in STA with both setup and hold checks on enable pins."
+    },
+    {
+      "id": 4,
+      "risk": "SRT-8 architecture decisions delayed to Phase 2: If SRT-8 is planned to share the SRT-4 datapath, the current architecture (PR_WIDTH=68, Q_WIDTH=64) is SRT-4-specific. A shared datapath would need parameterized widths and a much larger QDS table, increasing area for both modes.",
+      "severity": "low",
+      "mitigation": "Recommend separate SRT-4 and SRT-8 modules sharing only the interface convention (valid/ready, exception flags). The datapath and QDS for each radix are sufficiently different that a unified design adds complexity with no benefit."
+    },
+    {
+      "id": 5,
+      "risk": "Output register hold-time vs handshake: The quotient_o/remainder_o registers are updated in OUTPUT state and held until consumed. If ready_i arrives on the same cycle as valid_o=1, the next operation's PREPARE needs the previous output to be stable for reading while new operands are latched. No double-buffering — a late-consuming ready_i delays the next operation.",
+      "severity": "low",
+      "mitigation": "Accept as-designed for single-issue CPU integration. For out-of-order cores, add shadow output registers to decouple handshake."
+    }
+  ],
+  "phase_2_optimization_notes": {
+    "srt4_to_srt8_strategy": "Maintain separate div_srt4 and div_srt8 module families under a common div_srt namespace. SRT-8 will need: PR_WIDTH≈72 (wider by ~4 bits), QDS table 4× larger (9-bit pr_est × 4-bit d_hat), different D_scaled alignment (<<3 instead of <<2), and N_max≈21. The interface convention, FSM template, and OTF logic are reusable with parameterization.",
+    "pipeline_extension": "If throughput requirements demand >1 op/37 cycles, consider: (a) full pipelining — add result queue FIFO to decouple output handshake from next operation, (b) dual-module replication — two identical dividers with round-robin issue, (c) early-out forwarding — bypass N-cycle iteration for small operands.",
+    "power_optimization": "Priority order: (1) state-based clock gating (~60% dynamic reduction), (2) operand isolation — gate PR/Q/QM input muxes when not in active slice, (3) glitch filtering — insert pipeline registers on long combinational paths (CLZ tree, barrel shifters) if they show high glitch power in simulation."
+  }
+}

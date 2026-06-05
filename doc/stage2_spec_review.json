@@ -1,0 +1,120 @@
+{
+  "$schema": "stage2_spec_review",
+  "version": "1.1",
+  "design_name": "div_srt",
+  "reviewed_input": "doc/stage1_spec_extraction.json",
+  "status": "risky",
+  "consistent_facts": [
+    {
+      "category": "interface",
+      "item": "Top-level interface has 13 ports: clk, rst_n, valid_i, ready_o, dividend_i[64], divisor_i[64], signed_op_i, valid_o, ready_i, quotient_o[64], remainder_o[64], div_by_zero_o, overflow_o, busy_o. All use _i/_o convention consistently.",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "interface",
+      "item": "Handshake protocol: valid/ready pair on both input and output sides. No pipelining (busy=1 → ready=0).",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "parameter",
+      "item": "WIDTH=64 defines all primary datapath widths. PR_WIDTH=68 for CSA redundant representation. Q_WIDTH=64 for OTF accumulators. MAX_ITER=32 for K_max=62.",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "parameter",
+      "item": "All parameter derivation chains are consistent: MAX_ITER=(K_max+3)>>1 with K_max=62 (bounded by |D|=1 short-circuit). Q_WIDTH=2*MAX_ITER=64.",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "clock_reset",
+      "item": "Single clock domain: clk rising edge. Single reset: rst_n async active low. No CDC required.",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "error_handling",
+      "item": "Two exception conditions: D=0 (div_by_zero) and INT64_MIN/-1 (overflow). Priority-ordered: div_by_zero > overflow. Both are non-recoverable within the module — software must handle after output handshake.",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "error_handling",
+      "item": "Five short-circuit paths (priority order): D=0, INT64_MIN/-1, A=0, |A|<|D|, |D|=1. All bypass ITERATE/CORRECT entirely.",
+      "confidence": "confirmed"
+    },
+    {
+      "category": "parameter",
+      "item": "QDS parameters: QDS_PR_BITS=7, QDS_DIV_BITS=3. M1/M2 threshold table with ρ=2/3 covers all 8 d_hat values × 128 pr_est values.",
+      "confidence": "confirmed"
+    }
+  ],
+  "blocking_issues": [],
+  "risky_assumptions": [
+    {
+      "id": 1,
+      "category": "timing",
+      "description": "2.5 GHz target (400 ps): First synthesis with ASAP7 RVT xp33 cells showed CORRECT CPA WNS = -6836 ps at 2 GHz (500 ps). Even after CSA optimization (iteration loop <500 ps), the 68-bit CPA in CORRECT stage needs re-evaluation at 2.5 GHz. Likely requires SLVT cells, larger drive strengths, or further CPA pipelining.",
+      "risk_level": "high",
+      "mitigation": "Schedule a targeted re-synthesis at 2.5 GHz with ASAP7 SLVT cells. If CPA remains non-convergent, split CORRECT CPA into 2+ pipeline stages (currently already 3: CORRECT+CORRECT2+OUTPUT, may need more)."
+    },
+    {
+      "id": 2,
+      "category": "naming",
+      "description": "Design name 'div_srt' conflicts with all existing RTL module names ('div_srt4_*' prefix), testbench references ('Vdiv_srt4_top'), and design doc terminology. This will cause integration issues when connecting to the CPU core unless resolved.",
+      "risk_level": "medium",
+      "mitigation": "Plan a systematic rename pass in Phase 3: div_srt4_* → div_srt_* across all RTL, TB, sim_main.cpp, Makefile, and design doc. The rename is mechanical but must be complete (12+ files affected)."
+    },
+    {
+      "id": 3,
+      "category": "architecture",
+      "description": "SRT-8 upgrade path: Current architecture (PR_WIDTH=68, Q_WIDTH=64, MAX_ITER=32, QDS table with ρ=2/3) is SRT-4 specific. SRT-8 will require: wider PR (fractionally), larger Q (N_max≈21 → Q_WIDTH=42? or different), entirely different QDS table (7-bit × ? = much larger), and possibly different ρ. The two may not share a datapath.",
+      "risk_level": "medium",
+      "mitigation": "Decide in Phase 2 architecture planning: (a) separate SRT-4 and SRT-8 modules, (b) unified datapath with mode select, or (c) SRT-8 as a separate future project."
+    },
+    {
+      "id": 4,
+      "category": "architecture",
+      "description": "Non-pipelined design: busy=1 blocks new operations. For a CPU execution unit, this means the divider stalls the pipeline until completion (max 37 cycles at 2.5 GHz = 14.8 ns). Some CPUs use pipelined dividers or replicated units to hide latency.",
+      "risk_level": "low",
+      "mitigation": "Confirm with CPU integration team whether non-pipelined behavior is acceptable. If higher throughput is needed, consider: (a) full pipelining (back-to-back), (b) dual module replication, or (c) early-out with result forwarding."
+    }
+  ],
+  "software_visible_behavior_check": [
+    {
+      "item": "No MMIO registers",
+      "severity": "info",
+      "text": "The module has no memory-mapped configuration registers. All control is through the valid/ready handshake. This is consistent with an execution unit design and requires no register access layer.",
+      "resolution": "Accept as-designed. No register extraction needed."
+    },
+    {
+      "item": "Exception reporting",
+      "severity": "info",
+      "text": "Two exception flags (div_by_zero_o, overflow_o) are output with results. Software must sample them on the same cycle as valid_o=1. No interrupt path exists — software must poll or use the handshake completion.",
+      "resolution": "Accept as-designed. No interrupt controller integration needed."
+    },
+    {
+      "item": "Busy/ready protocol",
+      "severity": "info",
+      "text": "Software sees busy_o=1 while division is in progress. No out-of-order completion or early termination mechanism exists.",
+      "resolution": "Accept as-designed. Standard blocking execution unit."
+    }
+  ],
+  "recommended_clarifications": [
+    {
+      "id": 1,
+      "question": "Output signal behavior during IDLE: Are quotient_o/remainder_o held at last value, zeroed, or undefined when valid_o=0?",
+      "default_assumption": "Held at last result (registered outputs). Downstream logic should only sample on valid_o=1.",
+      "blocks_if_wrong": false
+    },
+    {
+      "id": 2,
+      "question": "2.5 GHz frequency target: Is this a hard requirement (must close timing at 2.5 GHz) or a target with margin (and 2 GHz is acceptable as fallback)?",
+      "default_assumption": "2.5 GHz is the design target; if unachievable with reasonable PPA, 2 GHz is acceptable.",
+      "blocks_if_wrong": true
+    },
+    {
+      "id": 3,
+      "question": "SRT-8 timeline: Is SRT-8 in scope for the current project, or is it a separate follow-up? This affects whether the architecture should be designed for extensibility now.",
+      "default_assumption": "SRT-8 is a separate phase after SRT-4 completion and tape-out.",
+      "blocks_if_wrong": false
+    }
+  ]
+}

@@ -1,72 +1,88 @@
-# DIV 模块开发 — SRT 整数除法器
+# DIV SRT 整数除法器 — 芯片研发项目
 
 ## 项目概述
-实现整数除法 DIV 模块，使用 SRT（Sweeney-Robertson-Tocher）算法，作为 CPU 核心执行部件的一部分。
+实现整数除法 DIV 模块，使用 **多模推测 SRT**（Multi-Mode Speculative SRT）算法。
+核心理念：**两级推测 + 多模动态跳转**——用低基构建大基，按剩余商位数贪心选择最优基数。
 
 ## 规格
-- **版本**：SRT-4 (Radix-4)，后续扩展 SRT-8
+- **核心算法**：多模两级推测，5 种模式动态切换
+
+| 模式 | 结构 | 每周期 bit | 适用剩余 |
+|------|------|-----------|---------|
+| SRT-32 | SRT4×SRT8 推测 | 5 | ≥5 |
+| SRT-16 | SRT4×SRT4 推测 | 4 | =4 |
+| SRT-8 | SRT8 单级 | 3 | =3 |
+| SRT-4 | SRT4 单级 | 2 | =2 |
+| SRT-2 | SRT2 单级 | 1 | =1 |
+
 - **位宽**：64-bit 被除数/除数/商/余数
-- **符号**：补码有符号/无符号（顶层 `signed_op_i` 选择），商符号 = 被除数 XOR 除数；余数符号 = 被除数
-- **控制**：状态机，**变长迭代**（N = ⌈(K+2)/2⌉ = (K+3)>>1, K = lzc_D - lzc_A）
-- **工艺**：TSMC 7nm
-- **接口**：Valid/Ready 握手
-- **商位集**：{-2, -1, 0, +1, +2}，ρ = 2/3
-- **迭代次数**：最大 N = 32（K=62，K=63 被 |D|=1 短路）
-- **延迟**：max 36 拍，min 5 拍（非短路）
-- **PR 宽度**：68 bit signed（PR_int = PR_math·2^65）
-- **OTF 累积器**：Q/QM 各 64 bit（= 2·N_max）
-- **余数**：R = PR-based 右移恢复（无 64×64 乘法器，面积优化）
-- **PR_0**：{4'b0, A_norm}（不右移，修复 unsigned MSB=1 bug）
-- **D_scaled**：D_norm << 2
+- **符号**：补码有符号/无符号（顶层 `signed_op_i` 选择）
+- **工艺**：TSMC 7nm / ASAP7，频率目标 **2.5 GHz**
+- **接口**：Valid/Ready 握手（非流水，单次处理一笔）
+- **推测路数**：**5 路**（由第一级 SRT-4 的 5 种商位决定，与第二级基数无关）
+- **最大迭代**：**13 cycles**（K=62, bits_total=64, 贪心 = 12×SRT32 + 1×SRT16）
+- **最长总延迟**：**18 cycles = 7.2 ns** @ 2.5 GHz
+- **PR 宽度**：68-bit signed
+- **Q_WIDTH**：66（5 bit/cyc × 13 cyc = 65，向上取整）
+- **OTF**：单更新（SRT2/4/8）+ 双更新（SRT16/32）
+- **倍数预计算**：PREPARE 阶段算好 3D（仅一次加法），迭代中无加法器
+- **余数**：PR-based 右移恢复（无 64×64 乘法器）
 - **短路特判**：D=0、INT64_MIN/-1、A=0、|A|<|D|、|D|=1
-- **异常**：除零（商=全1，余数=被除数）、INT64_MIN/-1 溢出（商=INT64_MIN，余数=0）
 
 ## 文件结构
 ```
 projects/div/
-├── CLAUDE.md
+├── CLAUDE.md               — 项目状态
+├── input_config.json        — 项目配置（Frontend Flow）
+├── tool-config.json         — EDA 工具检测
 ├── doc/
-│   └── design.md             — 设计文档（68-bit 方案，与模型严格对应）
-├── model/
-│   ├── srt4_68bit.py         — 主位级模型（PR=68 bit，已 PASS）
-│   ├── srt4_bitmodel.py      — 备用 bitmodel（Q/QM=66 bit，已 PASS）
-│   ├── srt4_model.py         — Fraction 参考模型（已 PASS）
-│   └── srt4_clean.py         — 旧 130-bit 方案（已废弃）
-├── rtl/
-│   ├── div_srt4_pkg.sv       — 常量、类型、QDS 阈值表 (Q_WIDTH=64, MAX_ITER=32)
-│   ├── div_srt4_qds.sv       — QDS 商位选择（组合逻辑）
-│   ├── div_srt4_datapath.sv  — 数据通路（PR-based R 恢复、无乘法器）
-│   └── div_srt4_top.sv       — 顶层（状态机、握手、符号、短路）
-├── sim/
-│   ├── Makefile              — run / wave100 / cycles 仿真入口
-│   ├── sim_main.cpp          — C++ testbench（6 tiers, 35925 cases）
-│   ├── wave_*.vcd            — directed / wave100 波形输出
-│   └── obj_dir/              — Verilator 输出
-└── tb/
-    └── div_srt4_tb.sv        — SV testbench（备用）
+│   ├── design.md            — 设计文档 v2.0（多模推测架构）
+│   ├── stage1_spec_extraction.json — Frontend Stage 1
+│   ├── stage2_spec_review.json     — Frontend Stage 2
+│   ├── stage3_microarch_analysis.json — Frontend Stage 3
+│   ├── stage4_rtl_architecture.json  — Frontend Stage 4
+│   ├── timing_estimate.md   — 时序估算
+│   └── first_synth_report.md — 第一次综合报告
+├── model/                   — Python 模型
+├── rtl/                     — v1.x RTL（待重命名+重写）
+├── sim/                     — 仿真环境
+├── tb/                      — SV testbench
+└── synth/                   — 综合脚本
 ```
 
-## 当前状态
-- **阶段**：RTL 完成，Verilator 回归 35925/35925 ALL PASS，准备综合
-- **综合工具**：待安装 OSS CAD Suite（Yosys + OpenSTA + GTKWave）
-- **上次进度**：2026-06-01 — 4项设计变更全部实施完毕，回归全PASS，EDA工具检测完成
+## 模块架构（新）
+```
+div_srt_top        — FSM + 握手 + 短路 + 符号 + 模式调度
+├── div_srt_qds2   — SRT-2 QDS 查表（自含）
+├── div_srt_qds4   — SRT-4 QDS 查表（被 SRT-32/16/4 共享）
+├── div_srt_qds8   — SRT-8 QDS 查表（被 SRT-32/8 共享）
+├── div_srt_preproc — PREPARE: CLZ + 归一化 + 倍数预计算
+├── div_srt_iter    — ITERATE: 主CSA + 5路推测 + PR寄存器
+├── div_srt_otf     — OTF: Q/QM 累积（单/双更新）
+├── div_srt_correct — CORRECT: 68-bit CPA + R恢复
+└── div_srt_pkg     — 参数/类型（无函数，无实现）
+```
 
-## 2026-05-30 设计变更（已实施）
-1. **Bug 修复**：PR_0={4'b0,A_norm} 不右移，D_scaled=D_norm<<2，pr_est=pr_q[66:60]
-2. **N 去 +1**：(K+3)>>1，MAX_ITER=32，Q_WIDTH=64
-3. **R PR-based**：去 64×64 乘法器，CORRECT 加回 D_scaled，右移恢复
-4. **K 奇偶分支**：shift=0 和 shift=1 两路 R 恢复公式
+## 阶段状态
 
-## 已完成
-- [x] Python 模型（31011 PASS：11 directed + 10000 signed + 10000 unsigned）
-- [x] 设计文档重写（doc/design.md，2026-05-30）
-- [x] RTL 4项变更实施（pkg/datapath/sim_main.cpp）
-- [x] Verilator 回归 35925/35925 ALL PASS（含 unsigned MSB=1 + unsigned random）
-- [x] EDA 工具检测（Verilator + Yosys 0.9，OSS CAD Suite 下载中）
+### ✅ Phase 1（算法探索与基础实现）
+- Python 模型 + RTL + 回归 35925 PASS + 第一次综合
 
-## 待办
-- [ ] 安装 OSS CAD Suite → Yosys（SV支持）+ OpenSTA + GTKWave
-- [ ] Yosys 综合（RTL → netlist）
-- [ ] 时序分析（STA）
-- [ ] 形式验证（LEC：RTL vs netlist）
-- [ ] SRT-8 版本
+### ✅ Phase 2（架构规划与算法优化）← 当前
+- [x] 两级推测架构设计（5 路推测，SRT-4×SRT-4 = SRT-16）
+- [x] 多模扩展（SRT-32/16/8/4/2，贪心跳转）
+- [x] 倍数预计算（3D 在 PREPARE 阶段，迭代中无加法器）
+- [x] Frontend Flow 4 阶段产出
+- [x] 设计文档 v2.0
+- [ ] QDS 阈值表定稿（下阶段）
+
+### 📋 Phase 3（RTL 实现与验证）← 待开始
+- [ ] Python 模型 v2.0（多模推测）
+- [ ] RTL: qds2/qds4/qds8 模块
+- [ ] RTL: preproc/iter/otf/correct 模块
+- [ ] RTL: top 重写（模式调度）
+- [ ] Verilator 回归
+- [ ] 综合 + STA（2.5 GHz）
+
+### 🔮 Phase 4（扩展）
+- SRT-8 独立版本 / 形式验证 / 流水线化

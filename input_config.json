@@ -1,0 +1,41 @@
+{
+  "version": "1.1",
+  "design_name": "div_srt",
+
+  "spec": {
+    "files": ["doc/design.md"],
+    "format": "markdown"
+  },
+
+  "rtl": {
+    "dir": "rtl/",
+    "top_module": "div_srt4_top",
+    "include_dirs": [],
+    "defines": [],
+    "filelist": ""
+  },
+
+  "tb": {
+    "dir": "tb/",
+    "top_module": "div_srt4_tb"
+  },
+
+  "sim": {
+    "dir": "sim/",
+    "simulator": "auto",
+    "waveform": "auto",
+    "dump_format": "auto",
+    "timescale": "1ns/1ps"
+  },
+
+  "target": {
+    "platform": "asic",
+    "clock_freq_mhz": 2500
+  },
+
+  "design_options": {},
+
+  "docs": {
+    "dir": "doc/"
+  }
+}

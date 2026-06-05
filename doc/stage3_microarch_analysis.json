@@ -1,0 +1,267 @@
+{
+  "$schema": "stage3_microarch_analysis",
+  "version": "1.1",
+  "design_name": "div_srt",
+  "reviewed_inputs": [
+    "stage1_spec_extraction.json",
+    "stage2_spec_review.json"
+  ],
+  "datapath": {
+    "summary": "SRT-4 radix-4 integer divider with carry-save (CSA) iteration loop and 68-bit PR width. The datapath has four major phases: (1) PREPARE — input absolute value, leading-zero count, barrel-shift normalization, (2) ITERATE — redundant PR shift-by-2 + QDS + mult select + 3:2 CSA compression, repeated N times, (3) CORRECT — 68-bit CPA merge of sum+carry, then sign correction and PR-based remainder recovery, (4) OUTPUT — sign application and handshake. The critical innovation is the CSA iteration loop: replacing a 68-bit CPA with XOR/AND gates reduces the iteration cycle from ~6.2ns to <0.5ns at 2GHz.",
+    "storage_elements": [
+      {
+        "name": "abs_a_q / abs_d_q",
+        "type": "register",
+        "depth": 1,
+        "width": 64,
+        "description": "Latched absolute values of dividend and divisor, captured on PREPARE. Hold steady through ITERATE/CORRECT for sign application in OUTPUT.",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "d_norm_q",
+        "type": "register",
+        "depth": 1,
+        "width": 64,
+        "description": "Normalized divisor: |D| << lzc_d, with MSB at bit 63. Used: (a) d_hat (bits[62:60]) for QDS, (b) D_scaled derivation for mult mux, (c) R recovery in K-odd path (bit[0]×D_norm addback).",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "pr_sum_q / pr_carry_q",
+        "type": "register",
+        "depth": 2,
+        "width": 68,
+        "description": "Redundant partial remainder (carry-save representation). pr_sum_q holds XOR result, pr_carry_q holds AND+left-shifted carry (LSB always 0). Together: actual PR = pr_sum_q + pr_carry_q. Updated every ITERATE cycle. Initialized to {4'b0, A_norm} and 0 on PREPARE.",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "pr_full_q",
+        "type": "register",
+        "depth": 1,
+        "width": 68,
+        "description": "Non-redundant PR after full 68-bit CPA merge (pr_sum_q + pr_carry_q). Latched in CORRECT stage, consumed in CORRECT2+OUTPUT.",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "Q_q / QM_q",
+        "type": "register",
+        "depth": 2,
+        "width": 64,
+        "description": "On-the-fly quotient accumulators. QM = Q - 1 always invariant. Updated every ITERATE cycle via OTF conversion rules (per q_digit). In CORRECT2: if PR negative, select QM (quotient was 1 too large).",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "n_q / shift_q / lzc_d_q / iter_cnt_q",
+        "type": "register",
+        "depth": 4,
+        "width": "7/7/7/6",
+        "description": "Control registers: N (iteration count), shift (quotient realignment {0,1}), lzc_d (for R recovery barrel shift), iter_cnt (current iteration index). latched in PREPARE, iter_cnt auto-increments in ITERATE.",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "dividend_q / divisor_q / signed_op_q",
+        "type": "register",
+        "depth": 3,
+        "width": "64/64/1",
+        "description": "Input operand registers. Latched from input pins on IDLE→PREPARE transition (valid_i & ready_o). Used throughout operation for sign control and short-circuit detection.",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "quotient_o_q / remainder_o_q",
+        "type": "register",
+        "depth": 2,
+        "width": 64,
+        "description": "Output data registers. Updated in OUTPUT state with sign-corrected result. Held until next OUTPUT or reset.",
+        "basis": "spec_stated"
+      },
+      {
+        "name": "div_by_zero_q / overflow_q",
+        "type": "register",
+        "depth": 2,
+        "width": 1,
+        "description": "Output exception flags. Updated alongside quotient/remainder in OUTPUT state. Held until next operation or reset.",
+        "basis": "spec_stated"
+      }
+    ],
+    "buffering_behavior": "No FIFO or data buffering. Single-operation, non-pipelined: one set of operand registers captures the current operation; new inputs while busy are ignored (ready_o=0). Output registers hold results until consumed (ready_i handshake) or overwritten by next operation.",
+    "arithmetic_units": [
+      {
+        "name": "CLZ64",
+        "operation": "compare",
+        "width": 64,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "barrel_shifter_64b",
+        "operation": "shift",
+        "width": 64,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "qds_lookup",
+        "operation": "custom",
+        "width": 7,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "mult_mux_68b",
+        "operation": "custom",
+        "width": 68,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "csa_3to2_68b",
+        "operation": "add",
+        "width": 68,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "cpa_7b_pr_est",
+        "operation": "add",
+        "width": 7,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "cpa_68b_correct",
+        "operation": "add",
+        "width": 68,
+        "pipeline_stages": 1
+      },
+      {
+        "name": "adder_68b_pr_correct",
+        "operation": "add",
+        "width": 68,
+        "pipeline_stages": 0
+      },
+      {
+        "name": "barrel_shifter_r_recovery",
+        "operation": "shift",
+        "width": 68,
+        "pipeline_stages": 0
+      }
+    ],
+    "data_flow": "Input: pins → IDLE latch → [abs → CLZ → norm → PREPARE regs] (combo in state) → [ITERATE loop: <<2 → 7-bit CPA → QDS → mult mux → CSA 3:2 → regs] × N → [CORRECT: 68-bit CPA → pr_full reg] → [CORRECT2: pr_full → sign select → Q shift → PR-based R recovery] → [OUTPUT: apply_sign → output regs] → pins."
+  },
+  "control": {
+    "summary": "6-state FSM governing pipeline stages IDLE → PREPARE → ITERATE → CORRECT → CORRECT2 → OUTPUT. Each state maps to a distinct datapath phase. Iteration is variable-length (N rounds, N determined by operand magnitude). Short-circuit conditions bypass ITERATE+CORRECT entirely (PREPARE→OUTPUT). Output handshake (valid_o/ready_i) controls return to IDLE.",
+    "fsm_list": [
+      {
+        "name": "div_srt_fsm",
+        "states": [
+          "ST_IDLE (000)",
+          "ST_PREPARE (001)",
+          "ST_ITERATE (010)",
+          "ST_CORRECT (011)",
+          "ST_CORRECT2 (101)",
+          "ST_OUTPUT (100)"
+        ],
+        "reset_state": "ST_IDLE",
+        "key_transitions": "IDLE→PREPARE: valid_i & ready_o. PREPARE→OUTPUT (short-circuit) or →ITERATE (normal). ITERATE→ITERATE (N-1 times, dp_done=0). ITERATE→CORRECT (dp_done=1). CORRECT→CORRECT2 (always). CORRECT2→OUTPUT (always). OUTPUT→IDLE (ready_i). No self-loop on OUTPUT (must consume before next op). All other transitions are unconditional.",
+        "complexity": "moderate",
+        "basis": "spec_stated"
+      }
+    ],
+    "scheduling": "Non-pipelined single-issue. FSM issues control pulses (prep_step, iter_step, corr_step) one at a time. No arbitration or out-of-order completion. The ITERATE state issues iter_step each cycle and relies on the datapath's combinational done_o signal to detect loop termination.",
+    "update_ordering": "(1) PREPARE → operand latching happens in IDLE→PREPARE transition (state update before combinational output calc). (2) All ITERATE updates (PR, Q/QM, iter_cnt) happen simultaneously on each clock edge. (3) CORRECT pr_full merges pr_sum+pr_carry; CORRECT2 consumes pr_full to compute Q_int+R combinationaly. (4) OUTPUT updates output registers with sign-corrected results. Ordering is strictly sequential with no data hazards between states."
+  },
+  "performance_constraints": {
+    "clock_freq_mhz": 2500,
+    "throughput": "1 operation per (5 + N_min_to_max) cycles, where N ∈ [1, 32]. Worst-case throughput: 1 op / 37 cycles. No pipelining — back-to-back operations must wait for full completion + handshake.",
+    "latency": "Short-circuit: 3 cycles (1.2 ns @ 2.5 GHz). |D|=1: 4 cycles (1.6 ns). Normal min (N=1): 6 cycles (2.4 ns). Normal max (N=32): 37 cycles (14.8 ns). Average (random 64-bit operands, uniform K distribution): ~19 cycles (7.6 ns).",
+    "pipeline_stages": 5,
+    "folding_factor": "1 operation at a time (no temporal folding). CSA iteration is fully unfolded within the serial loop.",
+    "basis": "inferred"
+  },
+  "low_power": {
+    "clock_gating": "Not implemented. All sequential elements receive un-gated clock. Significant power optimization opportunity: operand registers, Q/QM, and PR registers only need updates during specific states. Clock gating could reduce dynamic power by ~60-70% during IDLE periods.",
+    "power_domains": [
+      {
+        "name": "vdd_core",
+        "always_on": true,
+        "retention_required": false,
+        "description": "Single power domain. No power gating or retention strategy specified."
+      }
+    ],
+    "retention_requirements": "No retention specified. Since the module has no configuration state, power-on reset reinitializes everything. If integrated into a CPU with power gating, the divider can be fully reset on wake."
+  },
+  "hazards_and_ordering": [
+    {
+      "type": "backpressure",
+      "description": "Output handshake (valid_o/ready_i): when valid_o=1 and ready_i=0, OUTPUT state stalls. Results remain stable on output registers but the module is busy and cannot accept new inputs. No timeout or watchdog mechanism.",
+      "affected_modules": ["div_srt_top (OUTPUT state hold)"],
+      "resolution": "Standard stall — downstream consumer must assert ready_i to complete. No deadlock as long as consumer eventually accepts.",
+      "basis": "spec_stated"
+    },
+    {
+      "type": "control_hazard",
+      "description": "Input handshake (valid_i/ready_o): when valid_i arrives during non-IDLE state, ready_o=0 and the input is ignored. The module does not queue or buffer pending requests.",
+      "affected_modules": ["div_srt_top (IDLE gating)"],
+      "resolution": "CPU scheduler must ensure valid_i is not asserted until ready_o=1 (or tolerate dropped requests).",
+      "basis": "spec_stated"
+    },
+    {
+      "type": "data_hazard",
+      "description": "No read-after-write (RAW) or write-after-write (WAW) hazards within the iteration loop — iteration i writes PR/Q/QM, and iteration i+1 reads the just-written values on the next clock edge. This is the intended sequential behavior.",
+      "affected_modules": ["div_srt_datapath (iterate loop)"],
+      "resolution": "A single cycle of register delay between iterations is correct by design for the SRT algorithm.",
+      "basis": "inferred"
+    }
+  ],
+  "verification_sensitive": [
+    {
+      "behavior": "Async reset during ITERATE",
+      "why_sensitive": "The FSM resets to IDLE, but PR_sum/carry, Q/QM, and iter_cnt all clear to zero. If reset asserts while pr_full_q is partially computed in CORRECT, the next operation starts clean. Need to verify no X-propagation or metastability on the reset-release edge.",
+      "suggested_coverage": "Reset assertion during each FSM state; reset release timing relative to clock edge."
+    },
+    {
+      "behavior": "Short-circuit priority inversion",
+      "why_sensitive": "Five short-circuit conditions have a defined priority (D=0 > INT64_MIN/-1 > A=0 > |A|<|D| > |D|=1). If multiple conditions are true simultaneously (e.g., D=0 && A=0), the priority encoding must select the correct result. The current logic uses separate if-else in OUTPUT state — priority is implicit in the evaluation order.",
+      "suggested_coverage": "All 5!/(5-2)! = 20 pairwise combinations of simultaneous short-circuit conditions."
+    },
+    {
+      "behavior": "K parity boundary: shift=0 vs shift=1",
+      "why_sensitive": "The R recovery formula differs for K-even (shift=0, direct >>(lzc_d+2)) and K-odd (shift=1, ((>>2) + b*D_norm) >>(lzc_d+1)). The `q_corrected[0]` bit feeds a conditional add. Any error in this branch affects every K-odd operation (~50% of random inputs).",
+      "suggested_coverage": "Systematic K = even/odd cross-product at K=0,1,2,3,61,62 boundaries."
+    },
+    {
+      "behavior": "PR sign correction boundary: exactly zero",
+      "why_sensitive": "PR correction logic: if pr_negative (pr_full[67]=1), add D_scaled and select QM. If pr_full is exactly zero (pr_full=0), pr_negative=0, no correction applied. The boundary case where PR is negative but near-zero requires careful checking: does pr_full+ D_scaled ever overflow? Is Q/QM selection always correct?",
+      "suggested_coverage": "Directed tests where expected PR_N is zero or near-zero after N iterations."
+    },
+    {
+      "behavior": "QDS threshold boundary hits",
+      "why_sensitive": "QDS selection uses pr_est >= M2/M1/-M1/-M2. When pr_est exactly equals a threshold, the selection is at a decision boundary. The 7-bit CPA for pr_est has rounding error (low-order bits truncated), so the boundary behavior must be tolerant.",
+      "suggested_coverage": "Dither pr_est targeting each M{1,2} ±1 threshold for all 8 d_hat values (8×4×2 = 64 boundary tests per iteration)."
+    },
+    {
+      "behavior": "Unsigned MSB=1 (regression guard)",
+      "why_sensitive": "The PR_0 = {4'b0, A_norm} fix specifically targets the case where dividend[63]=1 in unsigned mode. The old PR_0 = A_norm>>1 lost the LSB in this case. Must ensure this fix is never regressed.",
+      "suggested_coverage": "Regression test: unsigned dividend with MSB=1 and bit[0]=1 (odd)."
+    }
+  ],
+  "architecture_risks": [
+    {
+      "id": 1,
+      "risk": "CORRECT 68-bit CPA timing at 2.5 GHz: First synthesis (2 GHz, RVT xp33) showed WNS = -6836 ps for the CORRECT CPA path. At 2.5 GHz the slack worsens to ~-6936 ps. The 68-bit CPA in CORRECT stage is currently a single-cycle operation. If it cannot meet 400 ps timing with SLVT/larger cells, it needs to be split into 2+ cycles (adding 1-2 cycles to every division).",
+      "severity": "high",
+      "mitigation": "1) Target re-synthesis with ASAP7 SLVT cells + larger drive strengths. 2) Consider splitting the 68-bit CPA into sub-adder groups with pipeline register. 3) Carry-lookahead or carry-select adder architecture instead of ripple-carry from ABC."
+    },
+    {
+      "id": 2,
+      "risk": "No clock gating: In a CPU execution unit, the divider is idle most of the time (divide instructions are infrequent). Without clock gating, all ~550 flops toggle every cycle, wasting dynamic power. 37-cycle latency × high toggle rate during iteration makes this a significant power hotspot.",
+      "severity": "medium",
+      "mitigation": "Add state-based clock gating: (a) disable PR/Q/QM clocks during IDLE and OUTPUT, (b) disable operand register clocks after PREPARE, (c) disable output register clocks after handshake completes. Use integrated clock gate (ICG) cells for synthesis."
+    },
+    {
+      "id": 3,
+      "risk": "SRT-4 to SRT-8 upgrade: SRT-8 would need pr_est width of ~8-9 bits (vs 7), QDS table of ~9×4 = 4096 entries (vs 8×128 implicit), different D_scaled alignment, and ρ re-evaluation. The existing FSM, handshake, and control infrastructure is reusable, but the datapath (PR width, mult mux, QDS) is SRT-4 specific.",
+      "severity": "medium",
+      "mitigation": "Decide in Phase 2: either (a) keep SRT-4 and SRT-8 as separate modules sharing only the FSM/control, or (b) design a parameterized datapath that configures for radix-4 or radix-8 at compile time."
+    },
+    {
+      "id": 4,
+      "risk": "Bus saturation under backpressure: If the downstream CPU core stalls (ready_i=0) while the divider is in OUTPUT, the module holds results indefinitely. This is safe but means a single slow consumer can block the entire divider pipeline. With no queuing, this is a performance bottleneck for bursty divide workloads.",
+      "severity": "low",
+      "mitigation": "Accept as-designed for single-issue CPU. For out-of-order cores, consider adding a result queue (FIFO) to decouple divider completion from consumer readiness."
+    }
+  ]
+}

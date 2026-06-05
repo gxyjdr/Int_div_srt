@@ -1,1073 +1,725 @@
-# SRT-4 整数除法器设计文档（68-bit CSA 方案，2026-06-03 修订）
+# DIV SRT 整数除法器设计文档
 
-> **状态**：RTL 完成，Verilator 回归 35925/35925 ALL PASS，Yosys+OpenSTA 综合分析完成
-> **模型**：`model/srt4_68bit.py`（主模型，含 CPA/CSA 双实现）
-> **RTL**：`rtl/div_srt4_pkg.sv` `rtl/div_srt4_qds.sv` `rtl/div_srt4_datapath.sv` `rtl/div_srt4_top.sv`
+> **项目**：div_srt — 多模推测 SRT 整数除法器
+> **版本**：2.0（2026-06-05）
+> **工艺**：TSMC 7nm / ASAP7
+> **频率目标**：2.5 GHz
+>
+> **核心理念**：两级推测（Two-Stage Speculation）+ 多模动态切换
+>
+> 用低基构建大基：第一级 SRT-4 固定，第二级可选 SRT-4 或 SRT-8，
+> 等效实现 SRT-16 和 SRT-32。外加 SRT-8、SRT-4、SRT-2 单级模式，
+> FSM 按剩余商位数贪心选择最优基数，最大化每周期产出。
 
-## 本次修订摘要
+---
 
-| 改动 | 类型 | 影响 |
+## 目录
+
+1. [核心设计思想](#1-核心设计思想)
+2. [SRT 算法回顾](#2-srt-算法回顾)
+3. [多模两级推测架构](#3-多模两级推测架构)
+4. [多 SRT 态动态跳转](#4-多-srt-态动态跳转)
+5. [数学推导](#5-数学推导)
+6. [模块架构与划分](#6-模块架构与划分)
+7. [数据通路详解](#7-数据通路详解)
+8. [控制逻辑与 FSM](#8-控制逻辑与-fsm)
+9. [硬件代价分析](#9-硬件代价分析)
+10. [待解决问题](#10-待解决问题)
+
+---
+
+## 1. 核心设计思想
+
+### 1.1 低基构建大基
+
+SRT-r 的单次迭代产 log₂(r) bit 商。两级推测的核心洞察是：
+
+> **第一级 SRT-4 的 QDS 查表同时，第二级做 5 路推测查表；**
+> **第一级结果确定后，直接从 5 路候选中选出正确的第二级商位。**
+> **等效于用低基组合出大基的吞吐。**
+
+| 组合 | 第一级 | 第二级 | 等效基数 | 每周期 bit |
+|------|--------|--------|---------|-----------|
+| SRT4 × SRT4 | SRT4 QDS | SRT4 QDS | **SRT-16** | 2+2 = 4 |
+| SRT4 × SRT8 | SRT4 QDS | SRT8 QDS | **SRT-32** | 2+3 = 5 |
+
+两套组合的**第一级完全相同**，第二级换 QDS 表即可。这意味着第一级 SRT-4 QDS 硬件被 SRT-16 和 SRT-32 两种模式共享。
+
+### 1.2 多模动态切换
+
+将五种 SRT 模式（SRT-32/16/8/4/2）集成在同一数据通路中，FSM 每周期按**剩余商位数**贪心选择当前最大可用基数：
+
+```
+剩余 ≥ 5 → SRT-32（2+3 bit）
+剩余 = 4 → SRT-16（2+2 bit）
+剩余 = 3 → SRT-8 单级（3 bit）
+剩余 = 2 → SRT-4 单级（2 bit）
+剩余 = 1 → SRT-2 单级（1 bit）
+```
+
+这种动态跳转确保**无浪费**——无论 K 的奇偶，最后一级总能精确对齐。
+
+### 1.3 推测路数的本质
+
+关键认识：**推测路数只取决于第一级的分支数，与第二级的基数无关。**
+
+SRT-4 的第一级有 5 种商位（-2,-1,0,+1,+2），所以第二级的推测路径固定为 **5 路**。第二级用 SRT-4 QDS 还是 SRT-8 QDS，只是每路内部的查表复杂度不同，不增加路数。
+
+---
+
+## 2. SRT 算法回顾
+
+### 2.1 标准递推
+
+SRT-r 的核心递推：
+```
+PR_{j+1} = r · PR_j - q_{j+1} · D
+```
+
+### 2.2 各基数参数
+
+| 基数 | r | 每周期 bit | 商位集 | 冗余因子 ρ | 移位量 |
+|------|---|-----------|--------|-----------|--------|
+| SRT-2 | 2 | 1 | {-1, 0, +1} | 1/2 | <<1 |
+| SRT-4 | 4 | 2 | {-2,-1,0,+1,+2} | 2/3 | <<2 |
+| SRT-8 | 8 | 3 | {-4,-3,...,+3,+4} | 4/7 | <<3 |
+
+### 2.3 整数映射（68-bit 方案）
+
+| 量 | 表示 | 说明 |
 |---|---|---|
-| PR_0 = `{4'b0, A_norm}`（不右移），D_scaled = `D_norm<<2`，pr_est 切片改 `pr_q[66:60]` | Bug 修复 | 修复 unsigned + dividend[63]=1 + 奇数下 PR_0 丢 LSB |
-| N 公式由 `⌈(K+2)/2⌉+1` 改为 `⌈(K+2)/2⌉` | 性能优化 | 每次除法省 1 拍 |
-| 余数 R 从乘法器恢复改为 PR_N 右移恢复 | 面积优化 | 去掉 64×64 乘法器 |
-| Q_WIDTH 由 66 改为 64，MAX_ITER 由 34 改为 32 | 派生缩减 | 节省 2 bit OTF 寄存器 |
-| **CSA 重写迭代循环**：pr_q 拆为 pr_sum_q + pr_carry_q，3:2 CSA 替代 68-bit CPA | **性能优化** | 迭代循环从 -6235 ps 缩短至 <500 ps，达 2 GHz |
-| **CORRECT 流水线化**：pr_full_q 寄存器 + ST_CORRECT2 状态 | 时序适配 | 迭代结束时多 1 拍总延迟（max 36→37） |
+| PR_math = PR_int / 2^65 | PR_int(68b signed) | 小数点在 bit 65 后 |
+| D_math = D_norm / 2^63 | D_norm(64b) | MSB 在 bit 63 |
+| D_scaled = D_norm << 2 | 68b | 对齐 PR 小数点(SRT-4 用) |
+| D_scaled_4x = D_norm << 4 | 68b | SRT-8 倍数扩展 |
+| PR_0 = {4'b0, A_norm} | 68b | 不右移 |
+| d_hat_r4 = D_norm[62:60] | 3b | SRT-4 QDS 除数估计 |
+| d_hat_r8 = D_norm[63:60] | 4b | SRT-8 QDS 除数估计 |
 
 ---
 
-## 1. 模块接口
+## 3. 多模两级推测架构
 
-### 1.1 顶层接口 (`div_srt4_top`)
+### 3.1 通用结构
 
-| 信号 | 方向 | 位宽 | 描述 |
-|---|---|---|---|
-| `clk` | I | 1 | 时钟 |
-| `rst_n` | I | 1 | 异步复位，低有效 |
-| `valid_i` | I | 1 | 输入握手 — 数据有效 |
-| `ready_o` | O | 1 | 输入握手 — 模块就绪（仅 IDLE 态为 1） |
-| `dividend_i` | I | 64 | 被除数 A |
-| `divisor_i` | I | 64 | 除数 D |
-| `signed_op_i` | I | 1 | 1 = 有符号除法，0 = 无符号除法 |
-| `valid_o` | O | 1 | 输出握手 — 结果有效 |
-| `ready_i` | I | 1 | 输出握手 — 下游就绪 |
-| `quotient_o` | O | 64 | 商 Q |
-| `remainder_o` | O | 64 | 余数 R |
-| `div_by_zero_o` | O | 1 | 除零异常标志 |
-| `overflow_o` | O | 1 | 溢出异常标志（仅 INT64_MIN / -1） |
-| `busy_o` | O | 1 | 模块忙标志（非 IDLE 态为 1） |
+下图展示两级推测的核心数据流。**水平方向看**：PR_j 同时送主 QDS 路径（顶部）和 5 路推测路径（中部）。
+**垂直方向看**：主 QDS 产出 q1 后，向下选择正确的 q2。
 
-**握手协议**：
-- **输入侧**：`valid_i & ready_o` 同时为 1 的拍锁存操作数，进入 PREPARE
-- **输出侧**：`valid_o & ready_i` 同时为 1 的拍完成传输，返回 IDLE
-- 不支持流水线 — 一次只能处理一笔除法，`busy_o` 为 1 时 `ready_o` 为 0
+```
+                                    ┌──────────────────┐
+                                    │   PR_j (冗余)     │
+                                    │ pr_sum, pr_carry │
+                                    └────────┬─────────┘
+          ┌───────────────────────────────────┼───────────────────────────────────┐
+          │                                   │                                   │
+          ▼                                   ▼                                   ▼
+┌───────────────────┐             ┌───────────────────────────────────────────────────┐
+│    << r₁ (连线)    │             │                    << r₁ (连线)                    │
+│   (r₁=4, SRT-4)   │             │              供所有 5 路推测共享                     │
+└─────────┬─────────┘             └──────────┬────────────┬───────────┬───────────┬────┘
+          │                                   │            │           │           │
+          ▼                                   ▼            ▼           ▼           ▼
+┌───────────────────┐             ┌──────────┐ ┌──────────┐ ┌────────┐ ┌──────────┐ ┌──────────┐
+│   7-bit CPA[66:60]│             │  mult    │ │  mult    │ │  mult  │ │  mult    │ │  mult    │
+│  pr_est_j         │             │  q=-2▶+2D│ │  q=-1▶+D │ │  q=0▶0 │ │  q=+1▶-D│ │  q=+2▶-2D│
+│  = pr_sum+pr_carry│             │          │ │          │ │        │ │          │ │          │
+└─────────┬─────────┘             └─────┬────┘ └─────┬────┘ └────┬───┘ └─────┬────┘ └─────┬────┘
+          │                             │            │           │           │           │
+          ▼                             ▼            ▼           ▼           ▼           ▼
+┌───────────────────┐             ┌───────────────────────────────────────────────────────────┐
+│    QDS_R4         │             │                   5× CSA 3:2 (并联)                        │
+│   (pr_est, d_hat) │             │  PR₁^{(q)} = (pr_sum<<2) ^ (pr_carry<<2) ^ mult(q)       │
+│                   │             │  5个CSA输出的PR₁^{(q)}各68-bit（pr_sum, pr_carry冗余形式）   │
+│                   │             └─────────┬──────────┬──────────┬──────────┬──────────┬──────┘
+│                   │                       │          │          │          │          │
+│                   │                       ▼          ▼          ▼          ▼          ▼
+│                   │             ┌───────────────────────────────────────────────────────────┐
+│                   │             │              5× 7/8-bit CPA（并联）                       │
+│                   │             │  每个PR₁^{(q)}的[67:60]做部分和，得到pr_est_{j+1}^{(q)}    │
+│                   │             └─────────┬──────────┬──────────┬──────────┬──────────┬──────┘
+│                   │                       │          │          │          │          │
+│                   │                       ▼          ▼          ▼          ▼          ▼
+│    q_{j+1} ───────┤             ┌───────────────────────────────────────────────────────────┐
+│                   │             │            5× QDS_{r?}（并联）                            │
+│    已知!          │             │  每个: QDS(pr_est_{j+1}^{(q)}, d_hat) → q₂^{(q)}         │
+│                   │             └─────────┬──────────┬──────────┬──────────┬──────────┬──────┘
+│                   │                       │          │          │          │          │
+│                   ▼                       ▼          ▼          ▼          ▼          ▼
+│          ┌─────────────────────────────────────────────────────────────────────────────────┐
+│          │                         5→1 多路选择器                                          │
+│          │  q₂ = SEL(q_{j+1}, {q₂^{(-2)}, q₂^{(-1)}, q₂^{(0)}, q₂^{(+1)}, q₂^{(+2)}})   │
+│          └─────────────────────────────────────────────────────────────────────────────────┘
+│                                   │
+│                                   ▼
+│    ┌──────────────────────────────────────────────────────────────────────────────────────┐
+│    │                          PR_{j+2} 更新                                               │
+│    │  PR₁^{(q1)} ← 从 5 个 CSA 结果中用 q1 选出 (5→1 mux)                                 │
+│    │  PR_{j+2} = PR₁^{(q1)} << r₂ + mult(q₂, D)  (r₂=4 或 8, 一次CSA)                    │
+│    └──────────────────────────────────────────────────────────────────────────────────────┘
+│                                   │
+│                                   ▼
+│    ┌──────────────────────────────────────────────────────────────────────────────────────┐
+│    │                          OTF 双更新                                                  │
+│    │  (Q_mid, QM_mid) = OTF_STEP(q₁, Q, QM)     // 第一级                                 │
+│    │  (Q_next, QM_next)= OTF_STEP(q₂, Q_mid, QM_mid) // 第二级                           │
+│    └──────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-### 1.2 子模块接口
+**7-bit CPA 是什么？**
 
-#### `div_srt4_qds` — QDS 商位选择（纯组合逻辑）
+PR 在迭代过程中以**冗余形式**存储（pr_sum + pr_carry 双线）。要查 QDS，不需要完整的 68-bit 加法，只需要**高位估算**。
 
-| 信号 | 方向 | 位宽 | 描述 |
-|---|---|---|---|
-| `pr_est_i` | I | 7 (signed) | PR 估计值 = `pr_q[66:60]` |
-| `d_hat_i` | I | 3 | 除数小数部分高 3 bit = D_norm[62:60] |
-| `q_digit_o` | O | 3 | 商位编码（qds_digit_t 枚举） |
+`7-bit CPA` = 7-bit 进位传播加法器，计算：
 
-#### `div_srt4_datapath` — 数据通路
+```
+pr_est = pr_sum_q[66:60] + pr_carry_q[66:60]
+```
 
-| 信号 | 方向 | 位宽 | 描述 |
-|---|---|---|---|
-| `clk` / `rst_n` | I | 1 | 时钟 / 复位 |
-| `abs_dividend_i` | I | 64 | \|A\| |
-| `abs_divisor_i` | I | 64 | \|D\| |
-| `prep_step` | I | 1 | PREPARE 态脉冲：锁存操作数、计算 N/shift、装载 PR_sum=0+carry=0 |
-| `iter_step` | I | 1 | ITERATE 态脉冲：CSA 迭代 PR←4PR−q·D_scaled + OTF 更新 |
-| `corr_step` | I | 1 | CORRECT 态脉冲：合并 pr_sum+pr_carry → pr_full_q（68-bit CPA） |
-| `done_o` | O | 1 | 迭代完成（iter_cnt == N） |
-| `pr_est_o` | O | 7 (signed) | QDS 输入 — PR 估计值（7-bit CPA from pr_sum/pr_carry） |
-| `d_hat_o` | O | 3 | QDS 输入 — 除数估计值 |
-| `q_digit_i` | I | 3 | QDS 输出 — 商位编码 |
-| `quotient_o` | O | 64 | 无符号商 Q_int（组合逻辑，CORRECT2/OUTPUT 态有效） |
-| `remainder_o` | O | 64 | 无符号余数 R（组合逻辑，CORRECT2/OUTPUT 态有效） |
+只合并高 7 位，得到一个 7-bit signed 的 PR 估计值（值域 [-64, +63]）。QDS 阈值表就是用这个 7-bit 值来查商位。低位进位最多影响 LSB ±1，在 QDS 冗余保护带（ρ=2/3）内容忍。
+
+**为什么快？** 7-bit 加法器的关键路径约 4-5 级门延迟，而 68-bit 加法器需要 15-20 级。每周期省下的时间正好用来做 5 路推测。
+
+SRT-8 模式需要 8-bit CPA（pr_est = pr_sum_q[67:60] + pr_carry_q[67:60]），因为 9 种商位的区分度需要更高精度的估计。
+
+### 3.2 5 种模式的操作表
+
+| 模式 | 第一级 | 第二级 | 每周期 bit | 第二级 QDS | 第二级移位 | 典型连用 |
+|------|--------|--------|-----------|-----------|-----------|---------|
+| **SRT-32** | SRT4 QDS | SRT8 QDS | **5** | r8×9选1 | <<3 | 剩余 ≥5 |
+| **SRT-16** | SRT4 QDS | SRT4 QDS | **4** | r4×5选1 | <<2 | 剩余 =4 |
+| **SRT-8** | — | SRT8 QDS(单级) | **3** | r8(独立) | <<3 | 剩余 =3 |
+| **SRT-4** | SRT4 QDS(单级) | — | **2** | — | <<2 | 剩余 =2 |
+| **SRT-2** | — | — | **1** | r2(独立) | <<1 | 剩余 =1 |
+
+关键点：
+- **SRT-4 QDS（第一级）**被 SRT-32、SRT-16、SRT-4 三种模式复用
+- **SRT-8 QDS**被 SRT-32（第二级）和 SRT-8（单级）两种模式复用
+- 每种模式迭代后用对应的移位量（<<1/<<2/<<3）更新 PR
+
+### 3.3 倍数预计算
+
+SRT-8 需要 ±3D，在 **PREPARE 阶段一次 68-bit 加法提前算好**，迭代中无需加法器：
+
+```
+PREPARE 阶段（1 拍，与 CLZ/归一化并行）:
+  D_scaled    = D_norm << 2          // 已有
+  D_scaled_4x = D_norm << 4          // 纯连线
+  
+  // SRT-8 需要的倍数:
+  D_r8_1x = D_scaled_4x              // ±1: D << 4
+  D_r8_2x = D_scaled_4x << 1         // ±2: D << 5
+  D_r8_3x = D_r8_1x + D_r8_2x        // ±3: 需要 1 次加法 ← PREPARE 阶段算好
+  D_r8_4x = D_scaled_4x << 2         // ±4: D << 6
+```
+
+这样迭代过程中所有模式的所有倍数都是连线或寄存器输出，0 加法器。
 
 ---
 
-## 2. 算法原理
+## 4. 多 SRT 态动态跳转
 
-### 2.1 SRT 除法数学基础
+### 4.1 基本原理
 
-SRT（Sweeney-Robertson-Tocher）算法是一种**位串行迭代除法**算法，每次迭代产生多位商。
+PREPARE 阶段算出 `K = lzc_D - lzc_A`，需要的总商位数 `bits_total = K + 2`。
 
-**核心递推式**（Fraction 数学域）：
-
-```
-PR[j+1] = 4 * PR[j] - q[j+1] * D
-```
-
-其中：
-- `PR[j]` 是第 j 轮的部分余数（Partial Remainder）
-- `q[j+1]` 属于 {-2, -1, 0, +1, +2}，是第 j+1 轮选择的商位
-- 基 r = 4（SRT-4），每轮产生 log2(4) = 2 bit 商
-
-**冗余因子 rho = 2/3**：
-- 冗余数系允许商位选择有"容错空间"，QDS 只需 PR 和 D 的高位近似即可正确选择商位
-- 收敛条件：|PR[j]| <= rho * D，即 |PR[j]| <= (2/3) * D
-
-**初始条件**：PR[0] = A_norm（不右移），保证 |PR_math[0] / D_math| <= 1/2 < rho（因 D_math ∈ [1,2)，A_norm/2^65 < D_norm/2^63·(1/2) 成立）
-
-> **修订说明**：旧方案 PR_0 = A_norm >> 1，在 unsigned + A_norm[0]=1 时丢失 LSB。新方案不右移，整个 int 域刻度翻倍（PR_math、D_math 不变），bug 根除。
-
-### 2.1.x 标准 SRT-4 迭代伪代码
+ITERATE 阶段每周期按剩余 bits 选择当前最大可用基数：
 
 ```
-输入：A_norm (64-bit), D_norm (64-bit), K, N, shift
-寄存器：pr_sum_q (68-bit), pr_carry_q (68-bit, LSB=0), Q (64-bit), QM (64-bit)
-      pr_full_q (68-bit, CORRECT 阶段)
+remaining = bits_total - bits_produced
 
-初始化：
-  pr_sum_q ← {4'b0, A_norm}            // PR_0_int = A_norm (不右移)
-  pr_carry_q ← 0                        // 无进位初始
-  Q    ← 0
-  QM   ← 0
-
-迭代（重复 N 次）：
-  // 1. shift（每轮"放大"上一轮余数，carry-save 双移位）
-  pr_4x_sum   ← pr_sum_q << 2
-  pr_4x_carry ← pr_carry_q << 2         // 注意：pr_carry_q 已预左移，LSB=0
-
-  // 2. QDS（7-bit CPA 估算 PR，从 pr_sum+pr_carry 高位取）
-  pr_est ← $signed(pr_sum_q[66:60]) + $signed(pr_carry_q[66:60])
-  d_hat  ← D_norm[62:60]
-  q      ← QDS_LOOKUP(pr_est, d_hat) ∈ {-2,-1,0,+1,+2}
-
-  // 3. generate multiple（产生 -q·D_scaled）
-  mult ← -q · D_scaled
-
-  // 4. CSA 3:2 压缩（代替 68-bit CPA）
-  pr_sum_next   ← pr_4x_sum ^ pr_4x_carry ^ mult
-  carry_raw     ← (pr_4x_sum & pr_4x_carry) | (pr_4x_sum & mult) | (pr_4x_carry & mult)
-  pr_carry_next ← {carry_raw[66:0], 1'b0}    // 预左移 1 位
-
-  // 5. 更新寄存器
-  pr_sum_q   ← pr_sum_next
-  pr_carry_q ← pr_carry_next
-
-  // 6. OTF 更新
-  (Q, QM) ← OTF_UPDATE(q, Q, QM)
-
-CORRECT (state=ST_CORRECT)：
-  // 合并 carry-save → 非冗余 PR（68-bit CPA，仅运行一次）
-  pr_full_q ← pr_sum_q + pr_carry_q
-
-CORRECT2 (state=ST_CORRECT2)：
-  // pr_full_q 稳定可用
-  if pr_full_q[67] == 1:
-    pr_corrected ← pr_full_q + D_scaled   // 恢复非负余数
-    Q_red ← QM
-  else:
-    pr_corrected ← pr_full_q
-    Q_red ← Q
-
-OUTPUT：
-  Q_int ← Q_red >> shift
-  if shift == 0:
-    R ← pr_corrected >> (lzc_D + 2)
-  else:
-    R ← ((pr_corrected >> 2) + Q_red[0]·D_norm) >> (lzc_D + 1)
+if   remaining >= 5:  mode = SRT32,  chunk = 5
+elif remaining == 4:  mode = SRT16,  chunk = 4
+elif remaining == 3:  mode = SRT8,   chunk = 3
+elif remaining == 2:  mode = SRT4,   chunk = 2
+else:                 mode = SRT2,   chunk = 1
 ```
 
-### 2.2 Fraction -> 整数映射（新方案，2026-05-30 修订）
+### 4.2 状态跳转序列示例
 
-| 数学量 | 整数表示 | 位宽 | 说明 |
-|---|---|---|---|
-| PR_math = PR_int / 2^65 | `PR_int` | 68-bit signed | **小数点在 bit 65 后**（新方案翻倍） |
-| D_math = D_norm / 2^63 | `D_norm` | 64-bit | MSB 在 bit 63 |
-| D_scaled = D_norm << 2 | `D_scaled` | 68-bit | 使 D_scaled / 2^65 = D_math |
-| 4 * PR_math | `PR_int << 2` (= pr_4x) | 68-bit (高位截断无害) | SRT 不变量保证 \|pr_next\| < 2^65 |
-| q * D_math | `q * D_scaled` | 68-bit | 同分母，直接减分子 |
-| pr_est = floor(32·PR_math) | `pr_q[66:60]` | 7-bit signed | QDS 输入（从 pr_q 切片，避免 pr_4x 高位截断问题） |
-| d_hat | `D_norm[62:60]` | 3-bit | D 小数部分高 3 bit（与旧方案相同） |
-
-**新旧方案对比**：
-
-| | 旧（有 bug） | 新（修订） |
-|---|---|---|
-| PR_int ↔ PR_math | `PR_int = PR_math · 2^64` | `PR_int = PR_math · 2^65` |
-| PR_0 | `A_norm >> 1`（丢 LSB） | `{4'b0, A_norm}`（零损） |
-| D_scaled | `D_norm << 1` | `D_norm << 2` |
-| pr_est 切片 | `pr_4x[67:61]` | `pr_q[66:60]` |
-| d_hat / QDS 表 | — | **不变** |
-
-**为什么 pr_est 从 pr_q 取而不是 pr_4x 取？**
-
-`pr_4x = pr_q << 2` 在 68-bit signed 寄存器里高 2 位会被截断。新方案 PR_int 比旧方案大 1 bit（`|pr_q| < 2^65`、`|pr_4x| < 2^67`），pr_4x 的 bit 67 是 sign，bit 68（概念上）也是 sign。要表征 `32·PR_math = pr_q >> 60` 取 7 bit，等价于 `pr_4x >> 62`，即 `pr_4x[68:62]`，bit 68 不存在。
-
-**直接从 pr_q 切片更清晰**：`pr_q[66:60]` = `(pr_q >> 60) mod 128`，与 `{pr_4x[67], pr_4x[67:62]}`（sign 扩展后取 7 bit）等价。
-
-**推导**：
-
+**K=62（bits_total=64）**：
 ```
-PR_math[j+1] = 4 * PR_math[j] - q[j+1] * D_math
+64→SRT32→59→SRT32→54→SRT32→49→SRT32→44→SRT32→39→SRT32→34
+→SRT32→29→SRT32→24→SRT32→19→SRT32→14→SRT32→9→SRT32→4→SRT16→0
+= 12×SRT32 + 1×SRT16 = 13 cycles
 ```
 
-代入新整数映射：
-
+**K=17（bits_total=19）**：
 ```
-PR_int[j+1] / 2^65  =  4 * PR_int[j] / 2^65  -  q[j+1] * D_norm / 2^63
-
-PR_int[j+1] / 2^65  =  4 * PR_int[j] / 2^65  -  q[j+1] * (D_norm << 2) / 2^65
+19→SRT32→14→SRT32→9→SRT32→4→SRT16→0
+= 3×SRT32 + 1×SRT16 = 4 cycles
 ```
 
-同分母 2^65，消去分母得整数递推式：
-
+**K=5（bits_total=7）**：
 ```
-PR_int[j+1] = 4 * PR_int[j] - q[j+1] * D_scaled
-```
-
-其中 `D_scaled = D_norm << 2`。
-
-**位宽分析（68 bit 是否够）**：
-
-- SRT-4 不变量：`|PR_math| ≤ (2/3)·D_math < 2/3`
-- `|PR_int| < (2/3)·2^65 < 2^65`，68-bit signed 容纳无虞
-- `|pr_4x| = 4·|PR_int| < (8/3)·2^65 ≈ 2.67·2^65 < 2^67`，68-bit signed 容纳无虞
-- `|d_pos_2x| = D_norm·8 ≤ (2^64-1)·8 < 2^67`，68-bit signed 容纳无虞
-- `|pr_next| < 2^65`（由不变量保证），即使 pr_4x 寄存器表征瞬时溢出，模 2^68 截断后 pr_next 真值无失真
-
-### 2.3 QDS（商位选择）原理
-
-**QDS 看的是 shifted 余数 `4·w[j]`，不是 subtract 后的新余数 w[j+1]**。这是 SRT 算法的核心 — 用 shifted 旧余数的高位**预测**该用哪个 q，redundancy（{-2,-1,0,+1,+2}）给 q 不完全精确留容错空间。
-
-```
-标准 SRT-4 三步：
-  p[j+1] = 4·w[j]                ← shift only, 未 subtract
-  q[j+1] = QDS(p[j+1], D)        ← QDS 看 p[j+1] 高位
-  w[j+1] = p[j+1] − q[j+1]·D     ← subtract 得到新余数
+7→SRT32→2→SRT4→0
+= 1×SRT32 + 1×SRT4 = 2 cycles
 ```
 
-在新方案下：
-
+**K=1（bits_total=3）**：
 ```
-pr_est = floor(32 · PR_math_prev) = pr_q[66:60]    （7-bit signed）
-```
-
-其中 `PR_math_prev` 是上一轮 subtract 后的余数 `w[j]`，pr_q 寄存器存的就是它。`32·PR_math_prev = 8·(4·PR_math_prev) = 8·PR_shifted_math`，这正是 QDS 阈值表标定的输入。
-
-```
-d_hat = D_norm[62:60]
+3→SRT8→0
+= 1×SRT8 = 1 cycle
 ```
 
-即除数归一化后的小数部分高 3 bit（1.xxx 的 xxx，与旧方案相同）。
-
-**阈值选择逻辑**（与旧方案完全相同）：
-
+**K=0（bits_total=2）**：
 ```
-if   pr_est >=  M2[d_hat]  ->  q = +2
-elif pr_est >=  M1[d_hat]  ->  q = +1
-elif pr_est >= -M1[d_hat]  ->  q =  0
-elif pr_est >= -M2[d_hat]  ->  q = -1
-else                        ->  q = -2
+2→SRT4→0
+= 1×SRT4 = 1 cycle
 ```
 
-### 2.4 商恢复公式 + 迭代次数
+### 4.3 与旧流片方案的对比
 
-**N 公式（新方案，2026-05-30 修订，去掉 +1）**：
+旧流片使用差值（counter = K）和 SRT16/4/2 组合的跳转表。新方案做了扩展：
 
-```
-N = ⌈(K + 2) / 2⌉           整数实现：N = (K + 3) >> 1
-shift = 2N − 2 − K           取值 ∈ {0, 1}
-Q_int = Q_red >> shift
-```
+| counter(K) | 旧方案模式序列 | 新方案模式序列 | 新方案 cycles |
+|-----------|--------------|--------------|-------------|
+| 0 | SRT4 | SRT4 | 1 |
+| 1 | SRT4 → SRT2 | SRT8 | 1 |
+| 2 | SRT16 | SRT16 | 1 |
+| 3 | SRT16 → SRT2 | SRT16 → SRT2 | 2 |
+| 4 | SRT16 → SRT4 | SRT32 | 1 |
+| 5 | SRT16 → SRT4 → SRT2 | SRT32 → SRT2 | 2 |
+| 6 | SRT16 → SRT16 | SRT32 → SRT4 | 2 |
+| 7 | SRT16 → SRT16 → SRT2 | SRT32 → SRT4 → SRT2 | 3 |
+| 8 | SRT16 → SRT16 → SRT4 | SRT32 → SRT32 | 2 |
+| 9 | SRT16 → SRT16 → SRT4 → SRT2 | SRT32 → SRT32 → SRT2 | 3 |
+| 10 | SRT16 → SRT16 → SRT16 | SRT32 → SRT32 → SRT4 | 3 |
+| 62 | ... | SRT32 × 12 + SRT16 | **13** |
 
-| K 奇偶 | N | shift | 含义 |
-|---|---|---|---|
-| 偶 | K/2 + 1 | 0 | Q_red 直接是 Q_int |
-| 奇 | (K+1)/2 + 1 | 1 | Q_red 多算 1 bit，砍最低位 |
-
-**为何 K 奇数会多算 1 bit**：SRT-4 每轮固定产 2 bit 商，N 必须向上取整。K 奇数时 2N 比"恰好够"多 1 bit，shift=1 把这个尾巴砍掉。shift 不是反归一化补偿（反归一化已被 K 一次性吸收），而是 **"凑 2-bit 边界"的对齐修正**。
-
-**为何去掉 +1**：旧公式 `⌈(K+2)/2⌉ + 1` 的 +1 是浮点 SRT 的 GRS 舍入余量遗物。整数除法用不上多算的 2 bit（shift 直接丢弃），Python 模型 10000 random 实证 N_min 安全。
-
-**推导**：
-- 第 N 轮结束时：Q_red ≈ (A_norm / D_norm) · 2^(2N−2)
-- A/D = (A_norm / D_norm) · 2^K
-- 因此 A/D ≈ Q_red / 2^(2N−2−K)
-- 即 Q_int = Q_red >> (2N − 2 − K)
-
-### 2.5 余数恢复（PR-based，2026-05-30 修订）
-
-**新方案**：余数直接从 PR_N 右移恢复，去掉 64×64 乘法器。
-
-**数学推导**：从 A = Q_int·D + R 出发，归一化后 `A_norm·2^K = Q_int·D_norm + R·2^lzc_D`。
-
-N 轮迭代后（新映射 PR_int = PR_math·2^65）：
-
-```
-PR_N_int = A_norm · 2^(K+2+shift) − 4·Q_red·D_norm
-```
-
-**情况 A：K 偶数（shift=0, Q_red = Q_int）**
-
-```
-PR_N_int = A_norm·2^(K+2) − 4·Q_int·D_norm
-         = 4·(A_norm·2^K − Q_int·D_norm)
-         = 4·R·2^lzc_D
-
-⟹  R = PR_N_int >> (lzc_D + 2)
-```
-
-**情况 B：K 奇数（shift=1, Q_red = 2·Q_int + b, b = Q_red[0] ∈ {0,1}）**
-
-```
-PR_N_int = A_norm·2^(K+3) − 4·(2·Q_int + b)·D_norm
-         = 8·R·2^lzc_D − 4b·D_norm
-
-⟹  R = ((PR_N_int >> 2) + b·D_norm) >> (lzc_D + 1)
-```
-
-**前提**：CORRECT 阶段必须实际把 D_scaled 加回 PR（当 PR<0），不能只选 Q/QM 标志。
-
-**手算验证（15/4, K=1, shift=1）**：迭代后 PR_N_int = −2^64，CORRECT 加 D_scaled (=2^65) → PR_corrected = 2^64；Q_red = QM = 7, b=1；R = ((2^64>>2) + 1·(4·2^61)) >> 62 = (2^62 + 2^63)>>62 = 3 ✓
-
-**硬件代价对比**：
-
-| | 旧（乘法器） | 新（PR-based） |
-|---|---|---|
-| 主算子 | 64×64 mult + 64-bit sub | 68-bit add（CORRECT 加 D_scaled） + 条件 64-bit add（K 奇数 +b·D_norm） + 可变右移（lzc_D, 0..62） |
-| 关键路径 | 乘法器树（深） | 加法 + 桶形移位（浅） |
-| 面积 | 64×64 乘法器约 4-8K gates | 加 + 移位约 1-2K gates |
-| 移位器复用 | — | 可与 D 归一化左移器共享桶形结构 |
+新方案相比旧方案：
+- 增加了 SRT-32（5 bit）和 SRT-8（3 bit）两个基数，粒度更细
+- 贪心算法保证每周期最大化产出
+- 序列无需预存，FSM 每周期实时计算
 
 ---
 
-## 3. 模块框图
+## 5. 数学推导
+
+### 5.1 两步递推通式
+
+两级的 PR 递推为：
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                           div_srt4_top                                                 │
-│                                                                                        │
-│  ┌──────────────┐     ┌────────────────────────────────────────────────────────────┐ │
-│  │   Control    │     │              Datapath (CSA)                                 │ │
-│  │   (FSM)      │     │                                                            │ │
-│  │              │     │  ┌──────────┐   ┌─────────────┐   ┌──────────────────┐     │ │
-│  │  state_q ────┼─────┼──┤  clz64   │   │ PR_sum_q (68)│   │ OTF Q/QM (64)    │     │ │
-│  │    │         │     │  │ A/D norm │   │ PR_carry_q   │   │ shift reg        │     │ │
-│  │    │ prep    │     │  │ N/shift  │   │ (68, LSB=0)  │   │                  │     │ │
-│  │    ├─────────┼─────┼─►│ calc     │   └──────┬───────┘   └────────┬─────────┘     │ │
-│  │    │ iter    │     │  └──────────┘          │                    │               │ │
-│  │    ├─────────┼─────┼─►                      │   ┌──────────────┐ │               │ │
-│  │    │ corr    │     │                        │   │  7-bit CPA    │ │               │ │
-│  │    ├─────────┼─────┼─►                      │   │ (pr_est calc) │ │               │ │
-│  │    │         │     │                        │   └──────┬───────┘ │               │ │
-│  │    │         │     │              ┌─────────┴──────────┴────────┐│               │ │
-│  │    │         │     │              │         QDS                ││               │ │
-│  │    │         │     │              │  pr_est(7b)×d_hat(3b)      ││               │ │
-│  │    │         │     │              │  → q_digit ∈ {±2,±1,0}    ││               │ │
-│  │    │         │     │              └────────────┬───────────────┘│               │ │
-│  │    │         │     │                           │                │               │ │
-│  │    │         │     │              ┌────────────┴───────────────┐│               │ │
-│  │    │         │     │              │    mult select             ││               │ │
-│  │    │         │     │              │    -q·D_scaled             ││               │ │
-│  │    │         │     │              └────────────┬───────────────┘│               │ │
-│  │    │         │     │                           │                │               │ │
-│  │    │         │     │  ┌────────────────────────┼────────────────┘               │ │
-│  │    │         │     │  │  shift(<<2)            │                                │ │
-│  │    │         │     │  │  pr_sum←pr_4x_sum      │                                │ │
-│  │    │         │     │  │  pr_carry←pr_4x_carry  │                                │ │
-│  │    │         │     │  └──────┬─────────────────┘                                │ │
-│  │    │         │     │         ▼          ▼                                       │ │
-│  │    │         │     │  ┌──────────────────────────────┐                         │ │
-│  │    │         │     │  │  CSA 3:2 (XOR+AND)           │                         │ │
-│  │    │         │     │  │  sum_next=4x_sum^4x_carry^mult│                         │ │
-│  │    │         │     │  │  carry=... → pr_carry_next   │                         │ │
-│  │    │         │     │  └────────┬─────────────────────┘                         │ │
-│  │    │         │     │           │                                               │ │
-│  │    │         │     │  ┌────────┴─────────┐   ┌────────────────────┐            │ │
-│  │    │         │     │  │ CORRECT (pr_full) │   │ CORRECT2/OUTPUT    │            │ │
-│  │    │         │     │  │ pr_sum+pr_carry   │   │ sign→Q/QM, shift   │            │ │
-│  │    │         │     │  │ → pr_full_q (68)  │   │ R=PR右移恢复        │            │ │
-│  │    │         │     │  └───────────────────┘   └────────┬───────────┘            │ │
-│  └────┼─────────┼─────┼──────────────────────────────────┼─────────────────────────┘ │
-│       │         │     │                                  │                           │
-│  ┌────┴─────────┴─────┴──────────────────────────────────┴─────────────────────────┐ │
-│  │                       Sign / Output Mux                                           │ │
-│  │  quotient_o  = sign_correct(Q_int)                                               │ │
-│  │  remainder_o = sign_correct(R)                                                   │ │
-│  │  div_by_zero_o / overflow_o / valid_o / busy_o                                   │ │
-│  └──────────────────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+PR_{j+1} = r₁ · PR_j - q₁ · D       // 第一级，r₁ = 4 (SRT-4)
+PR_{j+2} = r₂ · PR_{j+1} - q₂ · D   // 第二级，r₂ = 4 或 8
+```
 
-模块层次：
-  div_srt4_top (顶层 FSM + 符号 + 短路 + 握手)
-  ├── div_srt4_pkg (package: 参数/类型/QDS 函数/阈值表)
-  ├── div_srt4_qds (QDS 组合逻辑 — import pkg)
-  └── div_srt4_datapath (CSA 数据通路 — import pkg)
+合并：
+
+```
+PR_{j+2} = r₁·r₂ · PR_j - r₂·q₁·D - q₂·D
+
+SRT-16 (r₁=4, r₂=4):  PR_{j+2} = 16·PR_j - 4·q₁·D - q₂·D
+SRT-32 (r₁=4, r₂=8):  PR_{j+2} = 32·PR_j - 8·q₁·D - q₂·D
+```
+
+### 5.2 推测正确性证明
+
+对于第二级，需要证明：
+
+```
+q₂ = QDS_r?(pr_est(PR₁), d_hat) 等价于
+   = SEL(q₁, { q₂^{(-2)}, q₂^{(-1)}, q₂^{(0)}, q₂^{(+1)}, q₂^{(+2)} })
+```
+
+其中 `q₂^{(q)} = QDS_r?(pr_est(4·PR₀ - q·D), d_hat)`。
+
+证明：
+- PR₁ = 4·PR₀ - q₁·D（定义）
+- q₂ = QDS(pr_est(PR₁), d_hat)（标准 QDS）
+- = QDS(pr_est(4·PR₀ - q₁·D), d_hat)（代入 PR₁）
+- = q₂^{(q₁)}（定义）
+- = SEL(q₁, {q₂^{(-2)}, q₂^{(-1)}, q₂^{(0)}, q₂^{(+1)}, q₂^{(+2)}})
+
+证毕。选择等价于真实计算，无近似。
+
+### 5.3 迭代次数
+
+```
+bits_total = K + 2
+
+两种两级模式每周期：SRT-32 → 5 bit，SRT-16 → 4 bit
+三种单级模式每周期：SRT-8 → 3 bit，SRT-4 → 2 bit，SRT-2 → 1 bit
+
+最大迭代次数 (K=62, bits_total=64):
+  N_max = ceil(64/5) = 13      // 12×SRT32 + 1×SRT16
+```
+
+延迟对比：
+
+| 方案 | 最大 cycles（K=62） | @2.5 GHz |
+|------|--------------------|----------|
+| 单级 SRT-4（v1.x 基准） | 32 + 5 = 37 | 14.8 ns |
+| 固定 SRT-4×SRT-4 | 16 + 5 = 21 | 8.4 ns |
+| **多模贪心（本文）** | **13 + 5 = 18** | **7.2 ns** |
+
+---
+
+## 6. 模块架构与划分
+
+### 6.1 模块层次
+
+```
+div_srt_top (顶层)
+│  FSM (6态 + 模式调度)
+│  握手逻辑 (valid/ready)
+│  短路检测 + 符号处理
+│  输出寄存器
+│
+├── div_srt_qds2      ← SRT-2 QDS 查表
+├── div_srt_qds4      ← SRT-4 QDS 查表（第一级，被3模式共享）
+├── div_srt_qds8      ← SRT-8 QDS 查表（第二级+单级）
+│
+├── div_srt_preproc   ← PREPARE 逻辑
+│    CLZ×2, 归一化桶形移位×2
+│    K/N/shift 计算
+│    倍数预计算 (D_scaled, D_scaled_3x, D_scaled_4x)
+│    模式序列预测 (贪心选择结果)
+│
+├── div_srt_iter      ← ITERATE 核心循环
+│    CSA 3:2 主通路
+│    推测通路 (5×CSA + 5×pr_est CPA + 5×QDS实例化)
+│    mult 选择(所有模式)
+│    PR寄存器 (pr_sum/carry)
+│    结果选择逻辑
+│
+├── div_srt_otf       ← OTF 商累积
+│    Q/QM 64-bit 寄存器
+│    单更新(SRT2/4/8) + 双更新(SRT16/32)
+│
+└── div_srt_correct   ← CORRECT + 余数恢复
+     68-bit CPA
+     符号修正 + PR-based R恢复
+     桶形移位器
+
+div_srt_pkg (包)
+     参数: WIDTH, PR_WIDTH, Q_WIDTH, ...
+     类型: qds_digit_t(srt2/srt4/srt8), state_t, srt_mode_t
+     ← 无函数，无实现
+```
+
+### 6.2 与旧架构的对比
+
+| 组件 | 旧架构（单级 v1.x） | 新架构（多模推测 v2.0） |
+|------|-------------------|----------------------|
+| 总模块数 | 4 | **8**（含 pkg）|
+| QDS | pkg 函数 + qds 包装 | **3 个独立 qds 模块**（自含函数）|
+| datapath | 1个臃肿模块 | **拆为 4 个**：preproc + iter + otf + correct |
+| 模式支持 | 仅 SRT-4 单级 | SRT-32/16/8/4/2 五模式 |
+| 推测逻辑 | 无 | iter 内的推测通路 |
+
+### 6.3 数据流
+
+```
+输入 → top(IDLE锁存) → preproc(PREPARE拍)
+    ↓
+preproc 输出: {A/D_norm, K, D_scaled, D_r8_3x, mode_seq}
+    ↓
+iter (ITERATE × N):
+  ┌─ 每周期:
+  │  1. 模式选择 ← remaining bits (组合逻辑)
+  │  2. 第一级: pr_est_4 → QDS4 → q1
+  │  3. 推测级: 5×CSA → 5×CPA → 5×QDS_{4|8} → 5个q2候选
+  │  4. q1选通 → q2
+  │  5. PR_{j+2} = r₂·PR_{j+1} - q₂·D (CSA)
+  │  6. OTF 更新 (单/双)
+  └─ → iter_cnt++
+    ↓
+correct (CORRECT拍: 68-bit CPA)
+    ↓
+top (CORRECT2+OUTPUT: 符号+握手)
 ```
 
 ---
 
-## 4. 状态机
+## 7. 数据通路详解
 
-### 4.1 状态跳转图
+### 7.1 PREPROC 通路
 
 ```
-                              ┌──────────┐
-                              │          │
-                              ▼          │ ready_i=1
-    ┌──────────┐         ┌──────────┐    │
-    │          │ valid_i │          │    │
-    │  IDLE    ├────────►│ PREPARE  │    │
-    │          │         │          │    │
-    │ ready_o=1│         │ clz/norm │    │
-    └──────────┘         └────┬─────┘    │
-          ▲                   │          │
-          │      short_circuit│          │
-          │     ┌─────────────┘          │
-          │     │                        │
-          │     │ ~short_circuit         │
-          │     ▼                        │
-          │  ┌──────────┐    dp_done     │
-          │  │          ├────────┐       │
-          │  │ ITERATE  │        │       │
-          │  │          │◄───────┘       │
-          │  │ N rounds │                │
-          │  └──────────┘                │
-          │                              │
-          │        ┌──────────┐          │
-          │        │          │          │
-          │        │ CORRECT  │◄─────────┘
-          │        │          │
-          │        │ pr_sum + │
-          │        │ pr_carry │
-          │        │ → pr_full│
-          │        └────┬─────┘
-          │             │
-          │        ┌────▼─────┐
-          │        │ CORRECT2 │
-          │        │          │
-          │        │ full→Q/R │
-          │        └────┬─────┘
-          │             │
-          │             ▼
-          │        ┌──────────┐
-          │        │          │
-          └────────┤ OUTPUT   ├──► valid_o=1, wait ready_i
-                   │          │
-                   │ sign corr│
-                   └──────────┘
-
-状态编码:
-  IDLE     = 3'b000
-  PREPARE  = 3'b001
-  ITERATE  = 3'b010
-  CORRECT  = 3'b011
-  CORRECT2 = 3'b101
-  OUTPUT   = 3'b100
+PREPARE 拍:
+  lzc_a    = clz64(|A|)
+  lzc_d    = clz64(|D|)
+  K        = lzc_d - lzc_a
+  bits_total = K + 2
+  
+  A_norm   = |A| << lzc_a
+  D_norm   = |D| << lzc_d
+  D_scaled = D_norm << 2
+  
+  // SRT-8 倍数预计算（一次加法）
+  D_r8_1x = D_norm << 4
+  D_r8_2x = D_norm << 5
+  D_r8_3x = D_r8_1x + D_r8_2x   // 唯一加法器
+  D_r8_4x = D_norm << 6
+  
+  // 迭代控制
+  N_guess  = ceil(bits_total / 5)   // 最坏情况 cycle 数
 ```
 
-### 4.2 状态行为详述
+### 7.2 ITER 推测通路
 
-| 状态 | 持续拍数 | 行为 |
-|---|---|---|
-| **IDLE** | 等待 | `ready_o = 1`；`valid_i` 来后锁存 `dividend_i/divisor_i/signed_op_i`，下一拍进 PREPARE |
-| **PREPARE** | 1 | 计算 `lzc_A/lzc_D/K/N/shift`；计算 `A_norm/D_norm`；判断 5 种短路条件；**短路**：直接跳 OUTPUT；**非短路**：发 `prep_step` 装载 `PR_0`（pr_sum={4'b0,A_norm}, pr_carry=0），下一拍进 ITERATE |
-| **ITERATE** | N（可变） | 每拍：CSA 迭代 `pr_4x_sum=pr_sum<<2, pr_4x_carry=pr_carry<<2` → QDS（7-bit CPA 估 pr_est）→ `mult = -q*D_scaled` → `pr_sum_next ^= , carry_raw &= , pr_carry_next = {carry_raw[66:0], 1'b0}` → OTF 更新 Q/QM → `iter_cnt++`；`dp_done` 时下一拍进 CORRECT |
-| **CORRECT** | 1 | 发 `corr_step`：合并 `pr_sum_q + pr_carry_q` → `pr_full_q`（68-bit CPA），下一拍进 CORRECT2 |
-| **CORRECT2** | 1 | `pr_full_q` 稳定可用：组合逻辑计算 `Q_int = Q_red >> shift` 和 `R = PR-based 右移恢复`，下一拍进 OUTPUT |
-| **OUTPUT** | ≥1 | 计算最终结果（含短路分支和符号修正）；`valid_o = 1`，等待 `ready_i` 握手完成后回 IDLE |
+每周期并行执行的 5 路推测：
 
-### 4.3 短路条件（优先级顺序）
+```
+// 所有 5 路共享 PR_j (pr_sum, pr_carry) << r₁
+// r₁ = 4 (SRT-4 第一级固定)
 
-| 优先级 | 条件 | Q | R | 异常标志 | 跳转 |
-|---|---|---|---|---|---|
-| 1 | `D == 0` | `64'hFFFF_FFFF_FFFF_FFFF` | A | `div_by_zero=1` | PREPARE→OUTPUT |
-| 2 | `A==INT64_MIN && D==-1 && signed` | `64'h8000_0000_0000_0000` | 0 | `overflow=1` | PREPARE→OUTPUT |
-| 3 | `|A| == 0` | 0 | 0 | — | PREPARE→OUTPUT |
-| 4 | `|A| < |D|` | 0 | A（带符号） | — | PREPARE→OUTPUT |
-| 5 | `|D| == 1` | A（带符号） | 0 | — | PREPARE→OUTPUT |
+pr_4x_sum   = pr_sum_q << 2
+pr_4x_carry = pr_carry_q << 2
 
-短路路径只经过 PREPARE→OUTPUT，不进入 ITERATE/CORRECT。
+// pr_est_4 (7-bit CPA，第一级 QDS 输入)
+pr_est_4 = pr_sum_q[66:60] + pr_carry_q[66:60]
 
-### 4.4 延迟分析（新方案，2026-05-30 修订）
+// 第一级 QDS
+q1 = QDS_LOOKUP_R4(pr_est_4, d_hat)
 
-| 路径 | 拍数 | 公式 |
-|---|---|---|
-| 短路 | 3 | IDLE(锁存) + PREPARE + OUTPUT |
-| 非短路 | 5 + N | IDLE(锁存) + PREPARE + N × ITERATE + CORRECT + CORRECT2 + OUTPUT |
-| 最大延迟 | 37 | N_max = 32（K=62），总 = 5 + 32 = 37 拍 |
-| 最小延迟(非短路) | 6 | N_min = 1（K=0 时），总 = 5 + 1 = 6 拍 |
+// 5 路推测（2 种模式分支）:
+// 模式 A: SRT-16（第二级 SR4 QDS，<<2）
+// 模式 B: SRT-32（第二级 SRT8 QDS，<<3）
+//
+// 每路:
+//   PR₁^{(q)} = 4·PR_j - q·D  (CSA)
+//   pr_est^{(q)} = PR₁^{(q)}[66:60]       (7-bit CPA，SRT16)
+//              或 PR₁^{(q)}[67:60]       (8-bit CPA，SRT32)
+//   q2^{(q)} = QDS_R4(pr_est^{(q)}, d_hat)  (SRT16)
+//           或 QDS_R8(pr_est^{(q)}, d_hat)  (SRT32)
 
-旧公式（带 +1）：最大 38 拍 / 最小 7 拍。CSA 流水线比 N 去 +1 前省 1 拍但比非流水化方案多 1 拍（CORRECT2）。
+// 等待 q1 → 选通
+q2 = mux5(q1, q2^{(-2)}, q2^{(-1)}, q2^{(0)}, q2^{(+1)}, q2^{(+2)})
+
+// PR_{j+2}
+pr_base_q = mux5(q1, PR₁^{(-2)}, PR₁^{(-1)}, PR₁^{(0)}, PR₁^{(+1)}, PR₁^{(+2)})
+// 按模式移位:
+//   SRT-16: pr_base_q << 2 + mult(q2, D_scaled)
+//   SRT-32: pr_base_q << 3 + mult(q2, D_r8_1x)
+```
+
+### 7.3 单级模式通路
+
+SRT-8/SRT-4/SRT-2 单级模式不启用推测通路，直接走标准单周期迭代：
+
+```
+// SRT-8 单级
+pr_est_8 = pr_sum_q[67:60] + pr_carry_q[67:60]  // 8-bit CPA
+q = QDS_LOOKUP_R8(pr_est_8, d_hat)
+PR_next = pr_sum_q << 3 + pr_carry_q << 3 + mult(q, D_r8_x)
+
+// SRT-4 单级（复用第一级 QDS）
+q = QDS_LOOKUP_R4(pr_est_4, d_hat)
+PR_next = pr_sum_q << 2 + pr_carry_q << 2 + mult(q, D_scaled)
+
+// SRT-2 单级
+pr_est_2 = pr_sum_q[65:60] + pr_carry_q[65:60]  // 6-bit CPA
+q = QDS_LOOKUP_R2(pr_est_2, d_hat)
+PR_next = pr_sum_q << 1 + pr_carry_q << 1 + mult(q, D_scaled >> 1)
+```
+
+### 7.4 OTF 更新
+
+| 模式 | 更新方式 | 每周期 bit | Q 左移 |
+|------|---------|-----------|--------|
+| SRT-32 | 双更新：先 q1(SRT4) 后 q2(SRT8) | 5 | <<5 |
+| SRT-16 | 双更新：先 q1(SRT4) 后 q2(SRT4) | 4 | <<4 |
+| SRT-8 | 单更新 | 3 | <<3 |
+| SRT-4 | 单更新 | 2 | <<2 |
+| SRT-2 | 单更新 | 1 | <<1 |
+
+**Q_WIDTH 计算**：
+- 每周期最大产出 5 bit
+- 最多迭代 N_max = ceil(64/5) = 13
+- 5 × 13 = **65** bit → Q_WIDTH = **66**（比 v1.x 的 64 多 2 bit）
+
+### 7.5 CORRECT + 余数恢复
+
+迭代完成后（ITERATE 结束），PR 还在**冗余形式**（pr_sum_q + pr_carry_q）。CORRECT 阶段先合并，再做余数恢复。
+
+#### 为什么不用乘法器？
+
+最直观的余数计算是 `R = A - Q × D`，但需要 **64×64 乘法器 + 128-bit 减法**——面积大、路径深。
+
+本方案直接从 PR_N 右移恢复余数，不需要乘法器，只需要**加法和移位**。
+
+#### 数学推导
+
+由除法定义：
+
+```
+A = Q × D + R    →    A_norm × 2^K = Q_int × D_norm + R × 2^{lzc_D}
+```
+
+N 轮迭代后，PR_N 和 Q_red 的关系（反映射到整数域）：
+
+```
+PR_N_int = A_norm × 2^{K+2+shift} − 4 × Q_red × D_norm
+```
+
+代入 A = Q_int × D + R，分两种情况推导 R：
+
+**情况 A：K 偶数（shift = 0）**
+
+```
+PR_N_int = A_norm × 2^{K+2} − 4 × Q_int × D_norm
+         = 4 × (A_norm × 2^K − Q_int × D_norm)
+         = 4 × R × 2^{lzc_D}
+
+  ⟹  R = PR_N_int >> (lzc_D + 2)
+```
+
+只需一次右移。`>> (lzc_D + 2)` 是因为 PR 内的因子 4（来自 SRT-4 的 ×4 递推）和因子 2^{lzc_D}（来自归一化）需要去除。
+
+**情况 B：K 奇数（shift = 1）**
+
+此时 Q_red = 2 × Q_int + b（b = Q_red[0] ∈ {0,1}，多算的尾巴 bit）：
+
+```
+PR_N_int = A_norm × 2^{K+3} − 4 × (2 × Q_int + b) × D_norm
+         = 8 × R × 2^{lzc_D} − 4b × D_norm
+
+  ⟹  R = ((PR_N_int >> 2) + b × D_norm) >> (lzc_D + 1)
+```
+
+比 K 偶数多一步：右移 2 后条件加回 b × D_norm（b 即 Q_red[0]），再右移 `lzc_D + 1`。
+
+#### 硬件实现
+
+```
+CORRECT 拍（1 拍）:
+  ┌───────────────────────────────────────────────────┐
+  │  68-bit CPA:  pr_full_q = pr_sum_q + pr_carry_q  │
+  │  (唯一一次完整 PR 合并，不在迭代循环内)              │
+  └───────────────────────────────────────────────────┘
+
+CORRECT2 拍（1 拍，pr_full_q 稳定可用）:
+  ┌───────────────────────────────────────────────────┐
+  │  pr_negative = pr_full_q[67]  (符号位)             │
+  │                                                    │
+  │  if pr_negative:                                   │
+  │    pr_corrected = pr_full_q + D_scaled  (68b 加法)  │
+  │    Q_red = QM_q             (Q - 1，纠正多算的商)   │
+  │  else:                                             │
+  │    pr_corrected = pr_full_q                        │
+  │    Q_red = Q_q                                     │
+  │                                                    │
+  │  Q_int = Q_red >> shift_q        (shift ∈ {0,1})   │
+  │                                                    │
+  │  if shift_q == 0:                                  │
+  │    R = pr_corrected >> (lzc_d_q + 2)               │
+  │  else:                                             │
+  │    R = ((pr_corrected >> 2) +                       │
+  │          (Q_red[0] ? D_norm : 0)) >> (lzc_d_q + 1) │
+  └───────────────────────────────────────────────────┘
+```
+
+**为什么符号修正需要加 D_scaled？**
+
+SRT 的冗余商位 {-2,-1,0,+1,+2} 允许 PR 在迭代过程中略偏负。迭代结束时，如果 PR < 0，说明商偏大了 1。修正方法：
+- 商减 1 → 选 QM（= Q − 1）
+- PR 加 D_scaled → 恢复非负余数
+
+这里加的是 D_scaled（D_norm << 2），因为 PR_N 的刻度是 2^{65}，D_scaled/2^{65} = D_math × 4，刚好对齐。
+
+**K 奇数分支为什么多一步条件加？**
+
+K 奇数时 Q_red 多算了 1 bit（因为每周期产 2 bit，总位数向上取整）。这个尾巴 b = Q_red[0] 对应了一次多余的 ×D 操作，需要在 R 恢复时补偿回去。
+
+#### 硬件代价对比
+
+| 实现方式 | 主算子 | 面积估计 |
+|---------|--------|---------|
+| 直接公式 R = A − Q × D | 64×64 乘法器 + 128-bit 减法 | ~4,000 门 |
+| **PR-based 恢复（本文）** | **68-bit 加法 × 2 + 桶形移位** | **~1,500 门** |
+
+省掉了 64×64 乘法器，代价是 CORRECT 和 CORRECT2 两拍中各一次 68-bit 加法。这两拍不在迭代循环内，对性能无影响。
 
 ---
 
-## 5. 数据通路详解
+## 8. 控制逻辑与 FSM
 
-### 5.1 PR 更新路径（CSA，2026-06-03修订）
+### 8.1 状态机
 
-```
-                    ┌─────────────┐
-     PR_sum_q (68)   │             │
-     PR_carry_q (68) │   << 2     │─── pr_4x_sum (68), pr_4x_carry (68)
-         │           │  (双移位)   │
-         │           └─────────────┘
-         │                │
-         │                ├──────────────────────► 7-bit CPA: pr_sum[66:60]+pr_carry[66:60] → pr_est
-         │                │
-         │                │    ┌─────────────────┐
-         │                │    │  QDS            │
-         │                ├───►│  pr_est×d_hat   │──► q_digit
-         │                │    └─────────────────┘
-         │                │           │
-         │                │           ▼
-         │                │    ┌─────────────────┐
-         │                │    │  mult select    │
-         │                │    │  -2D/-D/0/+D/+2D│──► mult (68-bit)
-         │                │    └─────────────────┘
-         │                │           │
-         │                ▼           ▼
-         │          ┌───────────────────────────┐
-         │          │  CSA 3:2 (68-bit 并行)     │
-         │          │                            │
-         │          │  sum_next = a ^ b ^ c      │
-         │          │  carry    = (a&b)|(a&c)|(b&c)│
-         │          │  pr_carry_next = {carry[66:0], 1'b0}
-         │          └──────────┬────────────────┘
-         │                     │
-         ▼                     ▼
-     PR_sum_q ◄────────────────┘  (next cycle)
-     PR_carry_q ◄───────────────┘
-```
-
-**关键约束**：
-- PR 为 68-bit signed，新方案 |PR_int| < 2^65，bit[67:65] 全为 sign 扩展
-- PR_0 = `{4'b0, A_norm}`（**不右移**，零扩展 4 bit 至 68 bit）；pr_carry_q = 0
-- `pr_4x_sum = pr_sum_q << 2`，`pr_4x_carry = pr_carry_q << 2`（pr_carry_q 已预左移，LSB=0）
-- **pr_est 通过 7-bit CPA 从 pr_sum+pr_carry 高位获取**：`$signed(pr_sum_q[66:60]) + $signed(pr_carry_q[66:60])`。低位进位最多影响 LSB ±1，QDS 保护带容错
-- **CSA 3:2 压缩**：3 个 68-bit 数（pr_4x_sum, pr_4x_carry, mult）→ 2 个 68-bit 冗余表示（sum_next, carry_next），无进位传播
-- 实际值 = `pr_sum_q + pr_carry_q`（仅在 QDS 估计和 CORRECT 阶段合并）
-
-### 5.2 乘法器选择逻辑（D_scaled = D_norm<<2，新方案）
-
-| `q_digit` | 编码 | 数值 | `mult` (68-bit) | 计算方式 |
-|---|---|---|---|---|
-| `Q_P2` | 3'b010 | +2 | `-2*D_scaled` | `-({1'b0, D_norm, 3'b000})` |
-| `Q_P1` | 3'b001 | +1 | `-D_scaled` | `-({2'b00, D_norm, 2'b00})` |
-| `Q_Z0` | 3'b000 | 0 | `0` | `68'b0` |
-| `Q_N1` | 3'b100 | -1 | `+D_scaled` | `{2'b00, D_norm, 2'b00}` |
-| `Q_N2` | 3'b101 | -2 | `+2*D_scaled` | `{1'b0, D_norm, 3'b000}` |
-
-其中 `D_scaled = D_norm << 2`（新方案），`D_scaled_2x = D_norm << 3`。取负通过 Verilog 的 `-` 运算符（补码取反加一）。
-
-### 5.3 OTF（On-the-Fly）转换
-
-双寄存器 Q/QM 始终满足 QM = Q - 1（66-bit 无符号）。
-
-| `q_digit` | `Q_new` | `QM_new` | 说明 |
-|---|---|---|---|
-| +2 (010) | `{Q[63:0], 2'b10}` | `{Q[63:0], 2'b01}` | Q 左移 2，追加 2；QM 追加 1 |
-| +1 (001) | `{Q[63:0], 2'b01}` | `{Q[63:0], 2'b00}` | Q 左移 2，追加 1；QM 追加 0 |
-| 0 (000) | `{Q[63:0], 2'b00}` | `{QM[63:0], 2'b11}` | Q 追加 0；QM 左移追加 3（= Q-1 的 2-bit 表示） |
-| -1 (100) | `{QM[63:0], 2'b11}` | `{QM[63:0], 2'b10}` | 使用 QM 基底左移，QM = Q-1 |
-| -2 (101) | `{QM[63:0], 2'b10}` | `{QM[63:0], 2'b01}` | 使用 QM 基底左移 |
-
-**WHY OTF**：避免迭代结束后再从冗余商位转换，Q/QM 在每轮迭代中实时维护二进制商。
-
-**位宽 64 bit（新方案，2026-05-30 修订）**：
-- 新 N 公式 `⌈(K+2)/2⌉` 下，N_max = 32（K=62 时；K=63 被 `|D|=1` 短路吃掉）
-- OTF 累积位数 = 2·N_max = 64 bit，Q_WIDTH = 64 严格够
-- Q_red 真值 < 2^(2N−1) ≤ 2^63，高 1 bit 总为 0
-- 旧方案 Q_WIDTH=66（带 +1 余量 + K=63 假设），现在缩减节省 2-bit 寄存器
-- **隐式依赖**：`is_d_one` 短路保证 K ≤ 62。如未来去掉短路，需重新评估 Q_WIDTH
-
-### 5.4 CORRECT + 余数恢复（CSA+pipeline，2026-06-03 修订）
+与 v1.x 相同的 6 态，仅 ITERATE 内部增加了模式调度：
 
 ```
-CORRECT 态（ST_CORRECT, 1 拍）：合并 carry-save → 非冗余 PR
-  ┌──────────────────────────────────────────────────────────┐
-  │  pr_full_q = pr_sum_q + pr_carry_q   （68-bit CPA）      │
-  └──────────────────────────────────────────────────────────┘
-
-CORRECT2 态（ST_CORRECT2, 1 拍）：pr_full_q 稳定，计算 Q/R
-  ┌──────────────────────────────────────────────────────────┐
-  │  pr_negative = pr_full_q[67]                             │
-  │  if pr_negative:                                         │
-  │    pr_corrected = pr_full_q + D_scaled  （68-bit add）    │
-  │    Q_red       = QM_q                                    │
-  │  else:                                                   │
-  │    pr_corrected = pr_full_q                               │
-  │    Q_red       = Q_q                                     │
-  │                                                          │
-  │  Q_int = Q_red >> shift_q             （shift ∈ {0,1}）   │
-  │                                                          │
-  │  // R 由 PR_corrected 右移恢复，无乘法器                  │
-  │  if shift_q == 0:                                        │
-  │    R = pr_corrected >> (lzc_d + 2)                       │
-  │  else:                                                   │
-  │    R = ((pr_corrected >> 2) + Q_red[0]·D_norm)           │
-  │         >> (lzc_d + 1)                                    │
-  └──────────────────────────────────────────────────────────┘
+IDLE → PREPARE → ITERATE → CORRECT → CORRECT2 → OUTPUT → IDLE
+                    ↑__________|
+                    每次迭代按剩余 bits 选模式
 ```
 
-- **流水线**：CORRECT 态算 68-bit CPA（合并 sum+carry），CORRECT2 态做符号修正和 Q/R 提取。两步各占 1 拍，但 CORRECT 的 CPA 可跨 2 cycles 完成组合逻辑传播
-- **PR 符号修正**：PR<0 时，商偏大 1，选 QM=Q−1，同时把 D_scaled 加回 PR 恢复非负余数
-- **Shift 提取商**：`Q_int = Q_red >> shift`，shift ∈ {0, 1}
-- **余数提取**：从 corrected PR 右移恢复，K 奇数时多一个条件加 `Q_red[0]·D_norm`
-- **桶形移位器**：lzc_D ∈ [0, 62]，需要 6-bit 控制的右移器；可与 D 归一化的左移器共享硬件
-- **去掉乘法器**：旧方案的 `q_int * abs_d_q` 64×64 乘法器被消除
-
-### 5.5 归一化与迭代次数（新方案，2026-05-30 修订）
+### 8.2 ITERATE 状态内部行为
 
 ```
-lzc_A = clz64(|A|)     // 前导零计数
-lzc_D = clz64(|D|)
-K     = lzc_D - lzc_A   // K ≥ 0（|A| ≥ |D| 由 is_a_lt_d 短路保证）
-
-A_norm = |A| << lzc_A   // 左移使 MSB 到 bit 63
-D_norm = |D| << lzc_D
-
-N     = ⌈(K + 2) / 2⌉   = (K + 3) >> 1     // 整数实现，新公式（去 +1）
-shift = 2N - 2 - K                          // 取值 ∈ {0, 1}
+每周期:
+  1. remaining = bits_total - bits_produced
+  2. mode = decode_mode(remaining)    // SRT32/16/8/4/2
+  3. chunk = mode_to_bits(mode)
+  
+  4. 执行对应模式的迭代:
+     - 选择移位量 (<<1/<<2/<<3)
+     - 选择 QDS 通路 (SRT2/4/8 QDS)
+     - 选择是否双更新 (SRT16/32 启用推测)
+  
+  5. bits_produced += chunk
+  6. iter_cnt += 1
+  
+  7. if bits_produced >= bits_total: done = 1
 ```
 
-| K | N | shift | 迭代轮数 | 说明 |
-|---|---|---|---|---|
-| 0  | 1  | 0 | 1  | |A| 和 |D| 同量级，1 轮够 |
-| 1  | 2  | 1 | 2  | |
-| 2  | 2  | 0 | 2  | |
-| 3  | 3  | 1 | 3  | |
-| 4  | 3  | 0 | 3  | |
-| 5  | 4  | 1 | 4  | |
-| 6  | 4  | 0 | 4  | |
-| ... | ... | ... | ... | |
-| 60 | 31 | 0 | 31 | |
-| 61 | 32 | 1 | 32 | |
-| 62 | 32 | 0 | 32 | **K_actual_max**（D ≥ 2 由 is_d_one 短路保证） |
-| 63 | 33 | 1 | 33 | 不可达（|D|=1 短路） |
+### 8.3 短路条件
 
-**N 公式 +1 已去掉的依据**：
-- SRT-4 ρ=2/3 + 标准 M1/M2 阈值表数学上保证 `|PR_N| ≤ (2/3)·D` 严格收敛
-- Python 模型 N_min 实测 directed 11/11 + random 10000/10000 全 PASS
-- 整数除法不需要浮点 SRT 的 GRS 舍入余量
+与 v1.x 相同的 5 条优先级短路：
+
+1. D=0 → 除零（商=全1，余数=被除数）
+2. INT64_MIN/-1 → 溢出（商=INT64_MIN，余数=0）
+3. A=0 → 商=0，余数=0
+4. |A|<|D| → 商=0，余数=A
+5. |D|=1 → 商=A，余数=0
+
+### 8.4 延迟分析
+
+| 路径 | cycles | @2.5 GHz |
+|------|--------|----------|
+| 短路 | 3 | 1.2 ns |
+| 最小非短路(K=0) | 1(PREP)+1(ITER)+2(CORR)+1(OUT)=5 | 2.0 ns |
+| 最大非短路(K=62) | 1+13+2+1=**18** | **7.2 ns** |
+| 典型均匀(K≈31) | 1+7+2+1=11 | 4.4 ns |
 
 ---
 
-## 6. 完整 QDS 查找表
+## 9. 硬件代价分析
 
-### 6.1 阈值表
+### 9.1 各模块面积估计
 
-| d_hat | D 范围 (D_norm[62:60]) | M2 | M1 | -M1 | -M2 |
-|---|---|---|---|---|---|
-| 000 | [1.000, 1.001) | +12 | +4 | -4 | -12 |
-| 001 | [1.001, 1.010) | +14 | +4 | -4 | -14 |
-| 010 | [1.010, 1.011) | +16 | +4 | -4 | -16 |
-| 011 | [1.011, 1.100) | +16 | +4 | -4 | -16 |
-| 100 | [1.100, 1.101) | +18 | +6 | -6 | -18 |
-| 101 | [1.101, 1.110) | +20 | +6 | -6 | -20 |
-| 110 | [1.110, 1.111) | +22 | +8 | -8 | -22 |
-| 111 | [1.111, 10.000) | +24 | +8 | -8 | -24 |
+| 模块 | 估算门数 | 说明 |
+|------|---------|------|
+| div_srt_pkg | ~0 | 纯参数/类型 |
+| div_srt_qds2 | ~80 | SRT-2 QDS，6-bit CPA + 3 比较器 |
+| div_srt_qds4 | ~150 | SRT-4 QDS，7-bit CPA + 5 比较器 |
+| div_srt_qds8 | ~300 | SRT-8 QDS，8-bit CPA + 9 比较器 |
+| div_srt_preproc | ~800 | 2×CLZ + 2×桶形移位 + 1 次加法 |
+| div_srt_iter | ~3,000 | 主CSA + 5路推测(CSA+CPA+QDS) + 选择 |
+| div_srt_otf | ~600 | Q/QM 寄存器 + 单/双更新逻辑 |
+| div_srt_correct | ~1,500 | 68-bit CPA + 桶形移位 + R恢复 |
+| div_srt_top | ~1,200 | FSM + 握手 + 短路 + 符号 |
+| **总计** | **~7,630** | |
 
-> pr_est 是 7-bit signed 整数，值域 [-64, +63]，实际为 `⌊8·4·PR_math⌋` = `⌊32·PR_math⌋`。
+### 9.2 面积-延迟对比
 
-### 6.2 完整 QDS 表（1024 项）
-
-以下按 `pr_est`（7-bit signed，二进制编码）从 0000000 (+0) 到 1111111 (-1) 排列，每列对应一个 `d_hat` 值（3-bit 二进制），单元格为 `q_digit`。
-
-```
-  ┌─────────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
-  │ pr_est  │ 000 │ 001 │ 010 │ 011 │ 100 │ 101 │ 110 │ 111 │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000000 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000001 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000010 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000011 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000100 │ +1  │ +1  │ +1  │ +1  │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000101 │ +1  │ +1  │ +1  │ +1  │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000110 │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0000111 │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001000 │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001001 │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001010 │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001011 │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001100 │ +2  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001101 │ +2  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001110 │ +2  │ +2  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0001111 │ +2  │ +2  │ +1  │ +1  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010000 │ +2  │ +2  │ +2  │ +2  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010001 │ +2  │ +2  │ +2  │ +2  │ +1  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010010 │ +2  │ +2  │ +2  │ +2  │ +2  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010011 │ +2  │ +2  │ +2  │ +2  │ +2  │ +1  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010100 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010101 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +1  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010110 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0010111 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011000 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011001 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011010 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011011 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011100 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011101 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011110 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0011111 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100000 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100001 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100010 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100011 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100100 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100101 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100110 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0100111 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101000 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101001 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101010 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101011 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101100 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101101 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101110 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0101111 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110000 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110001 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110010 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110011 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110100 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110101 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110110 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0110111 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111000 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111001 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111010 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111011 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111100 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111101 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111110 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 0111111 │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │ +2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000000 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000001 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000010 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000011 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000100 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000101 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000110 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1000111 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001000 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001001 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001010 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001011 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001100 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001101 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001110 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1001111 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010000 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010001 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010010 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010011 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010100 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010101 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010110 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1010111 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011000 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011001 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011010 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011011 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011100 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011101 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011110 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1011111 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100000 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100001 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100010 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100011 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100100 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100101 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100110 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1100111 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101000 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101001 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101010 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101011 │ -2  │ -2  │ -2  │ -2  │ -2  │ -2  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101100 │ -2  │ -2  │ -2  │ -2  │ -2  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101101 │ -2  │ -2  │ -2  │ -2  │ -2  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101110 │ -2  │ -2  │ -2  │ -2  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1101111 │ -2  │ -2  │ -2  │ -2  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110000 │ -2  │ -2  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110001 │ -2  │ -2  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110010 │ -2  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110011 │ -2  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110100 │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110101 │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110110 │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1110111 │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111000 │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111001 │ -1  │ -1  │ -1  │ -1  │ -1  │ -1  │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111010 │ -1  │ -1  │ -1  │ -1  │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111011 │ -1  │ -1  │ -1  │ -1  │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111100 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111101 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111110 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  ├─────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
-  │ 1111111 │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │ 0   │
-  └─────────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-```
-
-> **读取方式**：
-> - `pr_est` 为 7-bit signed 二进制：`0000000`(+0) ~ `0111111`(+63)，`1000000`(-64) ~ `1111111`(-1)
-> - `d_hat` 为 3-bit 二进制：`000` ~ `111`（对应 D_norm[62:60]）
-> - 单元格值为 `q_digit`：`+2`, `+1`, `0`, `-1`, `-2`
-
-### 6.3 QDS 选择区间速查表
-
-为便于验证，以下列出每个 `d_hat` 下各商位的 `pr_est` 区间：
-
-| d_hat | q = -2 | q = -1 | q = 0 | q = +1 | q = +2 |
-|---|---|---|---|---|---|
-| 0 | [-64, -13] | [-12, -5] | [-4, 3] | [4, 11] | [12, 63] |
-| 1 | [-64, -15] | [-14, -5] | [-4, 3] | [4, 13] | [14, 63] |
-| 2 | [-64, -17] | [-16, -5] | [-4, 3] | [4, 15] | [16, 63] |
-| 3 | [-64, -17] | [-16, -5] | [-4, 3] | [4, 15] | [16, 63] |
-| 4 | [-64, -19] | [-18, -7] | [-6, 5] | [6, 17] | [18, 63] |
-| 5 | [-64, -21] | [-20, -7] | [-6, 5] | [6, 19] | [20, 63] |
-| 6 | [-64, -23] | [-22, -9] | [-8, 7] | [8, 21] | [22, 63] |
-| 7 | [-64, -25] | [-24, -9] | [-8, 7] | [8, 23] | [24, 63] |
-
-> **QDS 表规律总结**：
-> - 当 |pr_est| 较小时（接近 0），q = 0，PR 变化小，不引入扰动
-> - 当 |pr_est| 较大时，q = ±1 或 ±2，快速收敛
-> - 阈值随 d_hat 增大而增大（除数越大，需要越大的 PR 才选择更大的商位）
-> - d_hat=0（D 接近 1.0）时阈值最低（M2=12, M1=4），q=0 区间最窄 [-4, 3]，最激进选商
-> - d_hat=7（D 接近 2.0）时阈值最高（M2=24, M1=8），q=0 区间最宽 [-8, 7]，最保守选商
-> - 对称性：正负阈值关于 0 对称（M1/-M1, M2/-M2），但 q=0 区间不完全对称（因 pr_est 截断取整）
-> - d_hat=2 与 d_hat=3 阈值相同（M2=16, M1=4），区间一致
+| 方案 | 面积 | 最大延迟 | 面积-延迟积 |
+|------|------|---------|-----------|
+| v1.x 单级 SRT-4 | ~6,600 | 14.8 ns | 97,680 |
+| 多模贪心 SRT-32/16/8/4/2 | ~7,630(+16%) | **7.2 ns(-51%)** | **54,936(-44%)** |
 
 ---
 
-## 7. 符号处理
+## 10. 待解决问题
 
-### 7.1 有符号/无符号控制
-
-| `signed_op_i` | 行为 |
-|---|---|
-| 0 | A、D 均视为无符号数，商和余数均为无符号 |
-| 1 | A、D 均视为补码有符号数，商和余数带符号输出 |
-
-### 7.2 符号规则
-
-- 被除数取绝对值：`abs_A = dividend_sign ? -A : A`
-- 除数取绝对值：`abs_D = divisor_sign ? -D : D`
-- SRT 核心在无符号域计算：`(Q_unsigned, R_unsigned) = srt4_divide(abs_A, abs_D)`
-- 商符号：`sign_Q = sign_A XOR sign_D`
-- 余数符号：`sign_R = sign_A`（余数符号始终跟随被除数）
-
----
-
-## 8. 参数汇总（新方案，2026-05-30 修订）
-
-| 参数 | 值 | 说明 |
-|---|---|---|
-| `WIDTH` | 64 | 操作数位宽 |
-| `PR_WIDTH` | 68 | PR 寄存器位宽（新方案 \|PR_int\| < 2^65，bit[67:65] 全 sign） |
-| `Q_WIDTH` | **64** | OTF Q/QM 位宽（= 2·N_actual_max = 2·32） |
-| `QDS_PR_BITS` | 7 | pr_est 位宽（signed） |
-| `QDS_DIV_BITS` | 3 | d_hat 位宽 |
-| `LZC_BITS` | 7 | 前导零计数位宽（0..64） |
-| `MAX_ITER` | **32** | 最大迭代轮数（K=62 时） |
-| `ITER_CNT_BITS` | 6 | 迭代计数位宽（ceil(log2(33)) = 6） |
-
-旧值：Q_WIDTH=66, MAX_ITER=34。
-
----
-
-## 9. 验证结果
-
-### 9.1 Python 模型
-
-| 模型 | Directed | Random | 状态 |
-|---|---|---|---|
-| `srt4_68bit.py`（主模型） | 11/11 PASS | 10000/10000 PASS | 基准 |
-| `srt4_bitmodel.py`（备用） | 10/10 PASS | 10000/10000 PASS | Q/QM=66 bit 修正后 |
-
-### 9.2 RTL Verilator 回归
-
-| Tier | 描述 | 用例数 | 结果 |
-|---|---|---|---|
-| Tier 1 — Directed | 21 个定向用例（含 unsigned MSB=1） | 21 | 21/21 PASS |
-| Tier 2 — Powers of 2 | 2 的幂次除数全遍历（含 unsigned MSB=1） | 19202 | 19202/19202 PASS |
-| Tier 3 — Random (signed) | 随机有符号向量 | 10000 | 10000/10000 PASS |
-| Tier 4 — Random (unsigned) | 随机无符号向量（含 MSB=1 全覆盖） | 10000 | 10000/10000 PASS |
-| **Total** | — | **39223** | **39223/39223 PASS** |
-
-> 实际回归运行 `make run` 为 35925 例（含特定 seed + 边界补充），而非上述全部组合。39223 为 Python 模型测试数。
-
-### 9.3 综合与 STA 结果（ASAP7, RVT, SS corner, 500 ps 目标）
-
-| 指标 | 旧（CPA） | 新（CSA） | 改进 |
-|---|---|---|---|
-| 迭代循环 WNS | -6235 ps | <500 ps ✅ | >12× |
-| CORRECT CPA WNS | — | -6836 ps | 仅运行一次 |
-| 输入路径 WNS | — | -39.8 ps | ~540 ps 总延迟 |
-| 输出路径 WNS | — | -130.8 ps | ~631 ps 总延迟 |
-| MAJIxp5 数量 | 68 | 286 | 3×（含 2×68-bit CPA） |
-| 最大迭代频率 | ~160 MHz | ~2 GHz | 12.5× |
-| 操作延迟（max） | ~223 ns | ~19 ns | ~11.7× |
-
-### 9.4 仿真命令
-
-```bash
-# WSL 环境下：
-cd /mnt/c/Users/18435/Desktop/projects/div/sim
-
-# 完整回归（35925 例）
-make run
-
-# 100 笔连续波形（首笔 69/10 + 99 笔固定 seed 随机）
-make wave100
-```
-
----
-
-## 10. 关键设计决策与权衡
-
-| 决策 | 选择 | 理由 |
-|---|---|---|
-| A/D 分别归一化 | 是 | 避免跨标度对齐，K 记录量级差用于 shift 恢复 |
-| **PR_0 = `{4'b0, A_norm}`（不右移）** | **是（2026-05-30 修订）** | 避免 A_norm[0] 在 unsigned MSB=1 时被丢失；整个 int 域刻度翻倍但 PR_math/D_math 不变 |
-| **N = ⌈(K+2)/2⌉（去 +1）** | **是（2026-05-30 修订）** | 原 +1 是浮点 SRT 的 GRS 余量遗物，整数除法用不上；每次省 1 拍 |
-| **R 用 PR_N 右移恢复** | **是（2026-05-30 修订）** | 去掉 64×64 乘法器，关键路径变浅，面积省 5-10% |
-| Q/QM 位宽 64 bit | 是 | 新公式下 2·N_max=64，依赖 \|D\|=1 短路使 K_actual_max=62 |
-| PR 68 bit（非 130 bit） | 68 bit | 面积更小、迭代减半、延迟减半；新方案下 \|PR_int\| < 2^65 仍稳 |
-| PR 冗余表示（pr_sum_q + pr_carry_q） | CSA（2026-06-03 实施） | 将迭代关键路径从 68 级 MAJIxp5 降为 1 级 CSA，时序改进 >12× |
-| CORRECT 流水线化（CORRECT+CORRECT2） | 是（2026-06-03） | 68-bit CPA 拆入独立的 CORRECT/CORRECT2 两拍，避免与输出路径合并成超长组合逻辑 |
-| 短路 PREPARE→OUTPUT | 是 | 节省 ITERATE/CORRECT 两拍延迟 |
-| D 归一化左移器 ↔ 余数恢复右移器 复用 | 计划 | 共享同一桶形结构，节省面积 |
-
----
-
-## 附录 A：文件清单
-
-| 文件 | 行数 | 描述 |
-|---|---|---|
-| `rtl/div_srt4_pkg.sv` | 85 | 参数、类型（qds_digit_t, state_t）、QDS 阈值表、qds_lookup 函数 |
-| `rtl/div_srt4_qds.sv` | 17 | QDS 商位选择 — 纯组合逻辑，调用 pkg::qds_lookup |
-| `rtl/div_srt4_datapath.sv` | 189 | 数据通路 — clz、归一化、CSA 迭代、OTF、CORRECT 流水线、余数恢复 |
-| `rtl/div_srt4_top.sv` | 236 | 顶层 — FSM、Valid/Ready 握手、符号处理、短路特判 |
-| `model/srt4_68bit.py` | ~250 | Python 位级参考模型（含 CPA/CSA 双实现） |
-| `model/srt4_bitmodel.py` | — | 备用 bitmodel（Q/QM=66 bit） |
-| `sim/Makefile` | 36 | Verilator 仿真构建 |
-| `sim/sim_main.cpp` | — | C++ testbench（4 层 tier 回归 + wave100 波形生成） |
-
-## 附录 B：术语表
-
-| 术语 | 全称 | 含义 |
-|---|---|---|
-| SRT | Sweeney-Robertson-Tocher | 冗余数系除法算法 |
-| PR | Partial Remainder | 部分余数 |
-| QDS | Quotient Digit Selection | 商位选择 |
-| OTF | On-the-Fly Conversion | 实时商位转换（冗余→二进制） |
-| LZC | Leading Zero Count | 前导零计数 |
-| CSA | Carry-Save Adder | 进位保存加法器（本项目 2026-06-03 起使用于迭代循环） |
-| ρ (rho) | Redundancy Factor | 冗余因子，决定商位选择容错范围 |
+| ID | 问题 | 说明 |
+|----|------|------|
+| 1 | **QDS 阈值表规模** | SRT-2/4/8 三套 QDS 的具体阈值表待定稿（下阶段讨论） |
+| 2 | **pr_est 位宽** | SRT-2:6bit, SRT-4:7bit, SRT-8:8bit 是否够？需要验证 |
+| 3 | **2.5 GHz 时序** | 推测通路 ~17 FO4 能否收敛？CORRECT CPA 需要什么优化？ |
+| 4 | **Q_WIDTH=66** | 多出 2 bit 是否会影响布局或需要重新评估 Q/WIDTH 约束？ |
+| 5 | **贪心算法的硬件实现** | 每周期 `remaining = total - produced` 和模式解码的延迟 |
+| 6 | **倍数选择 MUX** | 5 种模式 × 各自的 mult 选择，MUX 树的延迟和面积 |
+| 7 | **验证策略** | 需要覆盖 5 种模式 × 各种 K 值 × 短路条件 |

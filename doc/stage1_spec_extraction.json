@@ -1,0 +1,340 @@
+{
+  "$schema": "stage1_spec_extraction",
+  "version": "1.1",
+  "design_name": "div_srt",
+  "source_files": [
+    "doc/design.md"
+  ],
+  "interfaces": {
+    "_note": "Clock and reset ports are documented in clock_reset_summary, not duplicated here.",
+    "control": [
+      {
+        "name": "valid_i",
+        "direction": "input",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Input handshake — data valid. When valid_i & ready_o are both high in the same cycle, the operands are latched and the FSM exits IDLE.",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "ready_o",
+        "direction": "output",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Input handshake — module ready. High only in IDLE state. When busy, ready_o = 0 (no pipelining).",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "signed_op_i",
+        "direction": "input",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Signed operation select: 1 = signed (two's complement) division, 0 = unsigned division. Latched with operands on input handshake.",
+        "source_ref": "design.md §7.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "valid_o",
+        "direction": "output",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Output handshake — result valid. High in OUTPUT state, waits for ready_i to complete the transfer.",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "ready_i",
+        "direction": "input",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Output handshake — downstream ready. When valid_o & ready_i are both high, transfer completes and FSM returns to IDLE.",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "div_by_zero_o",
+        "direction": "output",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Divide-by-zero exception flag. Asserted when divisor_i == 0. In this case quotient_o = 64'hFFFF_FFFF_FFFF_FFFF, remainder_o = dividend.",
+        "source_ref": "design.md §4.3 / §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "overflow_o",
+        "direction": "output",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Overflow exception flag. Asserted only for INT64_MIN / -1 in signed mode. quotient_o = INT64_MIN, remainder_o = 0.",
+        "source_ref": "design.md §4.3 / §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "busy_o",
+        "direction": "output",
+        "width": 1,
+        "protocol": "custom",
+        "description": "Module busy flag. High in all non-IDLE states. When busy_o = 1, ready_o = 0 (no pipelining).",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      }
+    ],
+    "data": [
+      {
+        "name": "dividend_i",
+        "direction": "input",
+        "width": "64",
+        "protocol": "custom",
+        "description": "Dividend A (numerator). 64-bit, signed or unsigned per signed_op_i. Latched on input handshake.",
+        "parameterized_width": "WIDTH",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "divisor_i",
+        "direction": "input",
+        "width": "64",
+        "protocol": "custom",
+        "description": "Divisor D (denominator). 64-bit, signed or unsigned per signed_op_i. Latched on input handshake.",
+        "parameterized_width": "WIDTH",
+        "source_ref": "design.md §1.1",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "quotient_o",
+        "direction": "output",
+        "width": "64",
+        "protocol": "custom",
+        "description": "Quotient Q. 64-bit result. For signed operations, sign = dividend_sign XOR divisor_sign.",
+        "parameterized_width": "WIDTH",
+        "source_ref": "design.md §1.1 / §7.2",
+        "confidence": "spec_stated"
+      },
+      {
+        "name": "remainder_o",
+        "direction": "output",
+        "width": "64",
+        "protocol": "custom",
+        "description": "Remainder R. 64-bit result. Sign follows dividend sign.",
+        "parameterized_width": "WIDTH",
+        "source_ref": "design.md §1.1 / §7.2",
+        "confidence": "spec_stated"
+      }
+    ]
+  },
+  "registers": [],
+  "parameters": [
+    {
+      "name": "WIDTH",
+      "default": "64",
+      "type": "integer",
+      "description": "Operand width in bits. All primary datapath widths (dividend, divisor, quotient, remainder) derive from this.",
+      "derived_signals": ["dividend_i", "divisor_i", "quotient_o", "remainder_o"],
+      "source_ref": "design.md §8",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "PR_WIDTH",
+      "default": "68",
+      "type": "integer",
+      "description": "Partial remainder register width in bits. |PR_int| < 2^65, so 68-bit signed (bits[67:65] are sign extension) is sufficient.",
+      "derived_signals": ["pr_sum_q", "pr_carry_q", "pr_full_q"],
+      "source_ref": "design.md §8 / §2.2",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "Q_WIDTH",
+      "default": "64",
+      "type": "integer",
+      "description": "OTF Q/QM accumulator width. Equals 2 × MAX_ITER = 64. |D|=1 short-circuit guarantees K ≤ 62, so N_max = 32.",
+      "derived_signals": ["Q_q", "QM_q"],
+      "source_ref": "design.md §8 / §5.3",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "MAX_ITER",
+      "default": "32",
+      "type": "integer",
+      "description": "Maximum iteration count. Set by N = (K+3)>>1, K_max = 62 (|D|=1 short-circuit prevents K=63).",
+      "derived_signals": ["iter_cnt", "dp_done"],
+      "source_ref": "design.md §8 / §5.5",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "QDS_PR_BITS",
+      "default": "7",
+      "type": "integer",
+      "description": "PR estimate width for QDS lookup (signed). pr_est = pr_q[66:60], 7-bit signed, range [-64, +63].",
+      "derived_signals": ["pr_est_o"],
+      "source_ref": "design.md §8 / §2.3",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "QDS_DIV_BITS",
+      "default": "3",
+      "type": "integer",
+      "description": "Divisor estimate width for QDS lookup. d_hat = D_norm[62:60], 3-bit, range [0, 7].",
+      "derived_signals": ["d_hat_o"],
+      "source_ref": "design.md §8 / §2.3",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "LZC_BITS",
+      "default": "7",
+      "type": "integer",
+      "description": "Leading-zero-counter output width. Range [0, 64], so 7 bits (ceil(log2(65))).",
+      "derived_signals": ["lzc_A", "lzc_D"],
+      "source_ref": "design.md §8",
+      "confidence": "spec_stated"
+    },
+    {
+      "name": "ITER_CNT_BITS",
+      "default": "6",
+      "type": "integer",
+      "description": "Iteration counter width. ceil(log2(MAX_ITER + 1)) = ceil(log2(33)) = 6.",
+      "derived_signals": ["iter_cnt"],
+      "source_ref": "design.md §8",
+      "confidence": "spec_stated"
+    }
+  ],
+  "clock_reset_summary": {
+    "num_clock_domains": 1,
+    "clocks": [
+      {
+        "name": "clk",
+        "direction": "input",
+        "frequency_mhz": 2500,
+        "description": "Primary system clock. Target frequency 2.5 GHz (400 ps period). All sequential logic clocked on rising edge."
+      }
+    ],
+    "resets": [
+      {
+        "name": "rst_n",
+        "direction": "input",
+        "active_low": true,
+        "async": true,
+        "description": "Asynchronous reset, active low. Resets FSM to IDLE state, clears all datapath registers (PR, Q/QM, iter_cnt)."
+      }
+    ],
+    "cdc_required": false,
+    "reset_sync_specified": false
+  },
+  "error_handling": {
+    "error_signals": [
+      {
+        "signal": "div_by_zero_o",
+        "condition": "divisor_i == 0",
+        "effect": "quotient_o = 64'hFFFF_FFFF_FFFF_FFFF, remainder_o = dividend_i, div_by_zero_o = 1",
+        "priority": 1,
+        "recoverable": false
+      },
+      {
+        "signal": "overflow_o",
+        "condition": "signed_op_i == 1 && dividend_i == INT64_MIN && divisor_i == -1",
+        "effect": "quotient_o = INT64_MIN (64'h8000_0000_0000_0000), remainder_o = 0, overflow_o = 1",
+        "priority": 2,
+        "recoverable": false
+      }
+    ],
+    "interrupt_sources": [],
+    "saturation_behavior": "Not applicable — integer division saturates by exception rather than clamping results.",
+    "fault_recovery": "No automatic recovery. Module returns to IDLE after output handshake completes. Software must re-issue the operation with valid operands."
+  },
+  "sw_visible_behavior": [
+    {
+      "item": "Input handshake",
+      "description": "Software initiates division by presenting dividend_i, divisor_i, signed_op_i with valid_i=1 when ready_o=1.",
+      "category": "sequencing"
+    },
+    {
+      "item": "Output handshake",
+      "description": "Results (quotient_o, remainder_o) become available when valid_o=1. Software asserts ready_i=1 to consume and unlock the module.",
+      "category": "sequencing"
+    },
+    {
+      "item": "Busy polling",
+      "description": "Software can poll busy_o to determine if the module is available for a new operation. When busy_o=0 (IDLE), ready_o=1.",
+      "category": "status"
+    },
+    {
+      "item": "Divide-by-zero",
+      "description": "div_by_zero_o exception: quotient saturated to all-1s, remainder = dividend. Software must check this flag before using results.",
+      "category": "status"
+    },
+    {
+      "item": "Overflow",
+      "description": "overflow_o exception: INT64_MIN / -1 case. Quotient = INT64_MIN, remainder = 0. Only fires in signed mode.",
+      "category": "status"
+    }
+  ],
+  "internal_only_behavior": [
+    {
+      "item": "FSM state",
+      "description": "6-state machine: IDLE → PREPARE → ITERATE → CORRECT → CORRECT2 → OUTPUT. Not exposed to software."
+    },
+    {
+      "item": "SRT-4 iteration loop",
+      "description": "Carry-save PR update: pr_4x_sum=pr_sum<<2, pr_4x_carry=pr_carry<<2 → QDS estimation → mult select → CSA 3:2 compression. Runs N iterations."
+    },
+    {
+      "item": "PR registers",
+      "description": "pr_sum_q (68-bit), pr_carry_q (68-bit, LSB=0) in CSA mode. Combined to pr_full_q in CORRECT stage via 68-bit CPA."
+    },
+    {
+      "item": "OTF Q/QM accumulators",
+      "description": "Dual 64-bit Q and QM registers updated every iteration per q_digit: QM = Q - 1 always holds."
+    },
+    {
+      "item": "QDS lookup table",
+      "description": "7-bit pr_est × 3-bit d_hat → q_digit ∈ {+2, +1, 0, -1, -2}. 8×128 = 1024-entry implicit table."
+    },
+    {
+      "item": "CLZ and normalization",
+      "description": "lzc_A = clz64(|A|), lzc_D = clz64(|D|). K = lzc_D - lzc_A. A_norm = |A|<<lzc_A, D_norm = |D|<<lzc_D."
+    },
+    {
+      "item": "N and shift calculation",
+      "description": "N = (K+3)>>1, shift = 2N-2-K ∈ {0,1}. Controls iteration count and quotient realignment."
+    },
+    {
+      "item": "Short-circuit conditions",
+      "description": "Five priority-ordered shortcuts: D=0, INT64_MIN/-1, A=0, |A|<|D|, |D|=1. Bypass ITERATE/CORRECT entirely."
+    },
+    {
+      "item": "CORRECT and remainder recovery",
+      "description": "PR-based remainder calculation: pr_full → sign correction → Q_red selection → shift extraction → barrel-shift right by lzc_D+2 or lzc_D+1."
+    },
+    {
+      "item": "Sign correction",
+      "description": "Output multiplexing for sign: signed_op_i selects signed/unsigned path. Quotient sign = dividend_sign XOR divisor_sign. Remainder sign = dividend_sign."
+    }
+  ],
+  "ambiguities": [
+    {
+      "id": 1,
+      "item": "Output signal behavior during IDLE/not-valid: Are quotient_o and remainder_o held at last valid result, or zeroed, or undefined between operations? The spec does not state reset value of output registers.",
+      "impact": "Low — downstream logic should only sample when valid_o=1, but affects formal verification and initial observability.",
+      "blocks_downstream": false
+    },
+    {
+      "id": 2,
+      "item": "ready_i backpressure: When valid_o=1 and ready_i=0, does the module hold outputs stable indefinitely? Likely yes (standard handshake), but not explicitly stated for all corner cases.",
+      "impact": "Low — standard practice, but could affect deadlock analysis if the downstream consumer stalls.",
+      "blocks_downstream": false
+    },
+    {
+      "id": 3,
+      "item": "SRT-8 upgrade path: The project roadmap mentions SRT-8 extension but the current architecture (PR_WIDTH=68, Q_WIDTH=64, MAX_ITER=32, QDS table) is specific to radix-4. The migration impact on datapath widths, QDS table size, and iteration formula has not been assessed.",
+      "impact": "Medium — future architecture decisions (e.g., unified vs separate QDS tables) depend on whether SRT-8 reuses or replaces the SRT-4 datapath.",
+      "blocks_downstream": false
+    },
+    {
+      "id": 4,
+      "item": "Timing closure at 2.5 GHz: The CORRECT stage 68-bit CPA had WNS = -6836 ps at 2 GHz (500 ps) with ASAP7 RVT xp33 cells. At 2.5 GHz (400 ps), the iteration loop (<500 ps at 2 GHz) still has margin, but the CPA path and overall timing closure strategy need re-evaluation.",
+      "impact": "Medium — affects whether CORRECT CPA needs further pipelining or cell-type upgrades (SLVT, larger drive) to achieve 2.5 GHz.",
+      "blocks_downstream": false
+    }
+  ]
+}
